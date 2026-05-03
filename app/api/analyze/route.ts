@@ -1,0 +1,442 @@
+import { GoogleGenerativeAI } from "@google/generative-ai";
+import { Octokit } from "@octokit/rest";
+
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
+const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
+
+/** Source files pulled from the repo tree for mapper/risk. Note: `*.cpp` also ends with `.c`, so `.c` is handled separately. */
+function isAllowedSourceBlobPath(path: string | undefined): boolean {
+  if (!path) return false;
+  const p = path.toLowerCase();
+  if (p.includes("node_modules")) return false;
+  const extensions = [
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".py",
+    ".java",
+    ".go",
+    ".rb",
+    ".php",
+    ".cpp",
+    ".rs",
+  ];
+  if (extensions.some((ext) => p.endsWith(ext))) return true;
+  return p.endsWith(".c") && !p.endsWith(".cpp");
+}
+
+/** Strip ```json fences often wrapping Gemma output */
+function stripJsonFences(text: string): string {
+  return text
+    .trim()
+    .replace(/^```(?:json)?\s*\n?/i, "")
+    .replace(/\n?\s*```\s*$/i, "")
+    .trim();
+}
+
+/**
+ * Extract first balanced `{ ... }` object from text (handles nested braces and strings).
+ * Greedy regex `\{[\s\S]*\}` often breaks on nested objects or multiple blocks.
+ */
+function extractBalancedJsonObject(text: string): string | null {
+  const s = stripJsonFences(text);
+  const start = s.indexOf("{");
+  if (start === -1) return null;
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = start; i < s.length; i++) {
+    const c = s[i];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (c === "\\" && inString) {
+      escape = true;
+      continue;
+    }
+    if (c === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (!inString) {
+      if (c === "{") depth++;
+      else if (c === "}") {
+        depth--;
+        if (depth === 0) return s.slice(start, i + 1);
+      }
+    }
+  }
+  return null;
+}
+
+function parseJsonLoose(text: string): unknown | null {
+  const balanced = extractBalancedJsonObject(text);
+  if (balanced) {
+    try {
+      return JSON.parse(balanced);
+    } catch {
+      /* try fallbacks below */
+    }
+  }
+  try {
+    const m = text.match(/\{[\s\S]*\}/);
+    if (m) return JSON.parse(m[0]);
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
+type ScorerShape = {
+  score: number;
+  coupling: number;
+  coverage: number;
+  dependencies: number;
+  deadCode: number;
+  recommendations: string[];
+};
+
+function clampPct(n: unknown, fallback: number): number {
+  const x = typeof n === "number" ? n : Number(n);
+  if (!Number.isFinite(x)) return fallback;
+  return Math.min(100, Math.max(0, Math.round(x)));
+}
+
+function normalizeScorerPayload(raw: unknown, fallback: ScorerShape): ScorerShape {
+  if (!raw || typeof raw !== "object") return fallback;
+  const o = raw as Record<string, unknown>;
+  const recs = o.recommendations;
+  const recommendations = Array.isArray(recs)
+    ? recs.filter((x): x is string => typeof x === "string").slice(0, 12)
+    : fallback.recommendations;
+
+  return {
+    score: clampPct(o.score, fallback.score),
+    coupling: clampPct(o.coupling, fallback.coupling),
+    coverage: clampPct(o.coverage, fallback.coverage),
+    dependencies: clampPct(o.dependencies, fallback.dependencies),
+    deadCode: clampPct(o.deadCode, fallback.deadCode),
+    recommendations:
+      recommendations.length > 0 ? recommendations : fallback.recommendations,
+  };
+}
+
+function heuristicScorerFallback(params: {
+  filesMapped: number;
+  risksCount: number;
+  depsCount: number;
+}): ScorerShape {
+  const { filesMapped, risksCount, depsCount } = params;
+  const riskPenalty = Math.min(45, risksCount * 6);
+  const couplingHint = Math.max(15, 100 - Math.min(80, filesMapped * 3));
+  const score = Math.max(
+    18,
+    Math.min(100, Math.round(88 - riskPenalty - Math.min(15, depsCount)))
+  );
+  return {
+    score,
+    coupling: clampPct(couplingHint, 50),
+    coverage: clampPct(55 + Math.min(30, filesMapped * 2), 55),
+    dependencies: clampPct(72 - Math.min(40, depsCount * 2), 55),
+    deadCode: clampPct(70 - Math.min(25, risksCount * 3), 60),
+    recommendations: [
+      risksCount > 0
+        ? `Address ${risksCount} reported risk(s), prioritizing critical items.`
+        : "Maintain current structure — no major risks reported.",
+      depsCount > 12
+        ? "Review dependency surface area and consolidate where possible."
+        : "Keep dependencies updated from package manifests.",
+      "Add or extend automated tests for critical paths.",
+    ],
+  };
+}
+
+export async function POST(req: Request) {
+  const { repoUrl } = await req.json();
+
+  // Parse GitHub URL
+  const match = repoUrl.match(/github\.com\/([^/]+)\/([^/]+)/);
+  if (!match) {
+    return Response.json({ error: "Invalid GitHub URL" }, { status: 400 });
+  }
+
+  const [, owner, repo] = match;
+
+  const encoder = new TextEncoder();
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      const send = (data: object) => {
+        controller.enqueue(
+          encoder.encode(`data: ${JSON.stringify(data)}\n\n`)
+        );
+      };
+
+      try {
+        // ── AGENT 1: MAPPER ──────────────────────────────
+        send({ agent: "mapper", status: "running", msg: "Reading repository files..." });
+
+        const { data: tree } = await octokit.git.getTree({
+          owner,
+          repo,
+          tree_sha: "HEAD",
+          recursive: "true",
+        });
+
+        const files = tree.tree
+          .filter((f) => f.type === "blob" && isAllowedSourceBlobPath(f.path))
+          .slice(0, 30);
+
+        const fileContents: { path: string; content: string }[] = [];
+        
+        for (const file of files.slice(0, 15)) {
+          try {
+            const { data: blob } = await octokit.repos.getContent({
+              owner,
+              repo,
+              path: file.path!,
+            });
+            if ("content" in blob) {
+              const content = Buffer.from(blob.content, "base64").toString("utf-8");
+              fileContents.push({ path: file.path!, content: content.slice(0, 500) });
+            }
+          } catch {}
+        }
+
+        const mapperModel = genAI.getGenerativeModel({
+          model: "gemma-3-27b-it",
+        });
+        const mapperPrompt = `You are a codebase mapper. Analyze these files and return ONLY valid JSON.
+Files: ${JSON.stringify(fileContents.map(f => f.path))}
+
+Return this exact JSON structure:
+{
+  "nodes": [{"id": "filename", "risk": "critical|warning|healthy", "deps": 0}],
+  "edges": [{"source": "file1", "target": "file2"}],
+  "summary": "brief summary"
+}`;
+
+        const mapperResult = await mapperModel.generateContent(mapperPrompt);
+        const mapperText = mapperResult.response.text();
+        
+        let mapperData = { nodes: [], edges: [], summary: `Mapped ${files.length} files` };
+        try {
+          const jsonMatch = mapperText.match(/\{[\s\S]*\}/);
+          if (jsonMatch) mapperData = JSON.parse(jsonMatch[0]);
+        } catch {}
+
+        send({ agent: "mapper", status: "done", data: mapperData, msg: `Mapped ${files.length} files successfully` });
+
+        // ── Fetch package.json for Auditor ─────────────────
+        const packageJsonBlobPaths = tree.tree
+          .filter(
+            (f) =>
+              f.type === "blob" &&
+              f.path &&
+              !f.path.includes("node_modules") &&
+              (f.path === "package.json" || f.path.endsWith("/package.json"))
+          )
+          .map((f) => f.path!)
+          .sort((a, b) => {
+            if (a === "package.json") return -1;
+            if (b === "package.json") return 1;
+            return a.split("/").length - b.split("/").length;
+          });
+
+        type PkgDepEntry = { name: string; range: string; kind: string; fromPath: string };
+        const auditorPackageJsonPaths: string[] = [];
+        const auditorDependencyEntries: PkgDepEntry[] = [];
+        const auditorPackageJsonSnippets: { path: string; preview: string }[] = [];
+        const seenDepNames = new Set<string>();
+
+        const recordDeps = (
+          rec: Record<string, string> | undefined,
+          kind: string,
+          pkgPath: string
+        ) => {
+          if (!rec) return;
+          for (const [name, range] of Object.entries(rec)) {
+            if (typeof range !== "string" || seenDepNames.has(name)) continue;
+            seenDepNames.add(name);
+            auditorDependencyEntries.push({ name, range, kind, fromPath: pkgPath });
+          }
+        };
+
+        for (const pkgPath of packageJsonBlobPaths.slice(0, 6)) {
+          try {
+            const { data: blob } = await octokit.repos.getContent({
+              owner,
+              repo,
+              path: pkgPath,
+            });
+            if (!("content" in blob)) continue;
+
+            const raw = Buffer.from(blob.content, "base64").toString("utf-8");
+            const pkg = JSON.parse(raw) as {
+              dependencies?: Record<string, string>;
+              devDependencies?: Record<string, string>;
+              peerDependencies?: Record<string, string>;
+              optionalDependencies?: Record<string, string>;
+            };
+
+            auditorPackageJsonPaths.push(pkgPath);
+            auditorPackageJsonSnippets.push({ path: pkgPath, preview: raw.slice(0, 4000) });
+            recordDeps(pkg.dependencies, "dependencies", pkgPath);
+            recordDeps(pkg.devDependencies, "devDependencies", pkgPath);
+            recordDeps(pkg.peerDependencies, "peerDependencies", pkgPath);
+            recordDeps(pkg.optionalDependencies, "optionalDependencies", pkgPath);
+          } catch {
+            /* invalid JSON or fetch error — skip */
+          }
+        }
+
+        // ── AGENT 2 & 3: PARALLEL ────────────────────────
+        send({ agent: "risk", status: "running", msg: "Analyzing risks and dependencies..." });
+        send({
+          agent: "auditor",
+          status: "running",
+          msg:
+            auditorPackageJsonPaths.length > 0
+              ? `Loaded ${auditorPackageJsonPaths.length} package.json file(s): ${auditorPackageJsonPaths.join(", ")}`
+              : "No package.json in tree — inferring dependencies from codebase files...",
+        });
+
+        const riskModel = genAI.getGenerativeModel({
+          model: "gemma-3-27b-it",
+        });
+        const auditorModel = genAI.getGenerativeModel({
+          model: "gemma-3-27b-it",
+        });
+
+        const riskPrompt = `You are a risk detector. Analyze this codebase for issues. Return ONLY valid JSON.
+Files analyzed: ${JSON.stringify(fileContents.map(f => ({ path: f.path, preview: f.content.slice(0, 200) })))}
+
+Return this exact JSON:
+{
+  "risks": [
+    {"file": "filename", "severity": "critical|warning|info", "issue": "description", "score": 85}
+  ],
+  "summary": "brief summary"
+}`;
+
+        const auditorPrompt = `You are a dependency auditor for a GitHub repository.
+
+PRIMARY SOURCE (use this when provided): Declared npm dependencies fetched from actual package.json file(s) in the repo Git tree — not guesses from source paths alone.
+
+Package.json blob paths fetched from repo (excluding node_modules):
+${JSON.stringify(auditorPackageJsonPaths.length ? auditorPackageJsonPaths : ["(none found)"])}
+
+Declared dependency entries (deduplicated by package name — first occurrence wins when multiple package.json files exist). Fields: name, semver range declared in manifest, dependency kind (dependencies / devDependencies / etc.), originating package.json path:
+${JSON.stringify(auditorDependencyEntries.slice(0, 200))}
+
+Truncated raw package.json excerpts for context:
+${JSON.stringify(auditorPackageJsonSnippets)}
+
+Code file paths sampled from the codebase (secondary context):
+${JSON.stringify(fileContents.map((f) => f.path))}
+
+Instructions:
+1. Prefer analyzing the real manifests above. Reference package names and version ranges exactly as declared.
+2. If no package.json was found, infer dependencies cautiously from file paths only and note that in the summary.
+3. Assess whether entries look outdated, loosely specified, or plausibly vulnerable from general ecosystem knowledge — return conservative severity unless clearly critical.
+
+Return ONLY valid JSON:
+{
+  "dependencies": [
+    {"name": "package", "version": "range or inferred", "status": "vulnerable|outdated|ok", "severity": "critical|warning|ok"}
+  ],
+  "summary": "brief summary referencing whether package.json was used"
+}`;
+
+        const [riskResult, auditResult] = await Promise.all([
+          riskModel.generateContent(riskPrompt),
+          auditorModel.generateContent(auditorPrompt),
+        ]);
+
+        let riskData = { risks: [], summary: "Analysis complete" };
+        let auditData = { dependencies: [], summary: "Audit complete" };
+
+        try {
+          const riskMatch = riskResult.response.text().match(/\{[\s\S]*\}/);
+          if (riskMatch) riskData = JSON.parse(riskMatch[0]);
+        } catch {}
+
+        try {
+          const auditMatch = auditResult.response.text().match(/\{[\s\S]*\}/);
+          if (auditMatch) auditData = JSON.parse(auditMatch[0]);
+        } catch {}
+
+        send({ agent: "risk", status: "done", data: riskData, msg: `Found ${riskData.risks?.length || 0} issues` });
+        send({ agent: "auditor", status: "done", data: auditData, msg: `Scanned ${auditData.dependencies?.length || 0} dependencies` });
+
+        // ── AGENT 4: SCORER ──────────────────────────────
+        send({ agent: "scorer", status: "running", msg: "Calculating health score..." });
+
+        const scorerModel = genAI.getGenerativeModel({
+          model: "gemma-3-27b-it",
+        });
+
+        const scorerNodes = Array.isArray(mapperData.nodes) ? mapperData.nodes : [];
+        const scorerRisks = Array.isArray(riskData.risks) ? riskData.risks : [];
+        const scorerDeps = Array.isArray(auditData.dependencies) ? auditData.dependencies : [];
+        const filesMappedCount = scorerNodes.length || files.length;
+
+        const scorerPrompt = `Analyze this codebase health data and return ONLY a JSON object. No markdown, no explanation.
+Just raw JSON.
+
+Data:
+- Files mapped: ${filesMappedCount}
+- Risks found: ${scorerRisks.length}
+- Risk details: ${JSON.stringify(scorerRisks.slice(0, 50))}
+- Dependencies: ${scorerDeps.length}
+
+Each numeric field must be an integer from 0 through 100. recommendations must be exactly 3 short strings. Output raw JSON only — no angle brackets in the final answer.
+
+Return exactly this JSON shape:
+{
+  "score": <number 0-100>,
+  "coupling": <number 0-100>,
+  "coverage": <number 0-100>,
+  "dependencies": <number 0-100>,
+  "deadCode": <number 0-100>,
+  "recommendations": ["rec1", "rec2", "rec3"]
+}`;
+
+        const scorerResult = await scorerModel.generateContent(scorerPrompt);
+        const scorerRawText = scorerResult.response.text();
+
+        console.log("[scorer] raw model response:\n", scorerRawText);
+
+        const fallback = heuristicScorerFallback({
+          filesMapped: filesMappedCount,
+          risksCount: scorerRisks.length,
+          depsCount: scorerDeps.length,
+        });
+
+        const parsed = parseJsonLoose(scorerRawText);
+        if (parsed === null) {
+          console.warn("[scorer] Could not parse JSON from response; using heuristic fallback.");
+        }
+        const scorerData = normalizeScorerPayload(parsed, fallback);
+
+        send({ agent: "scorer", status: "done", data: scorerData, msg: `Health score: ${scorerData.score}/100` });
+        send({ agent: "complete", status: "done", msg: "Analysis complete!" });
+
+      } catch (error: any) {
+        send({ agent: "error", status: "error", msg: error.message });
+      } finally {
+        controller.close();
+      }
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+    },
+  });
+}
