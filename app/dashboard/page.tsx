@@ -71,7 +71,27 @@ const BUTTON_TEXT = "#e8f0ed";
 const KPI_ICON_COLOR = "#6F9487";
 const SIDEBAR_WIDTH = 240;
 
-type NavId = "overview" | "map" | "risk" | "deps" | "insights" | "settings";
+const quotes = [
+  { quote: "The cost of a data breach averages $4.45 million.", source: "IBM Security Report 2023" },
+  {
+    quote: "73% of developers don't have time to manually audit their dependencies.",
+    source: "Stack Overflow Survey",
+  },
+  {
+    quote: "Most vulnerabilities are known for 60 days before they are exploited.",
+    source: "Ponemon Institute",
+  },
+  { quote: "The average codebase contains 158 known vulnerabilities.", source: "Veracode Research" },
+  {
+    quote: "Only 25% of developers say security is a priority in their workflow.",
+    source: "GitHub Security Report",
+  },
+  { quote: "Supply chain attacks increased 742% in 2022.", source: "Sonatype Report" },
+  { quote: "A single outdated dependency can expose your entire application.", source: "OWASP" },
+  { quote: "Security should be a feature, not an afterthought.", source: "StackSense" },
+];
+
+type NavId = "overview" | "map" | "risk" | "deps" | "insights" | "analyze";
 
 const NAV_ITEMS: { id: NavId; label: string; icon: typeof Home }[] = [
   { id: "overview", label: "Overview", icon: Home },
@@ -79,7 +99,7 @@ const NAV_ITEMS: { id: NavId; label: string; icon: typeof Home }[] = [
   { id: "risk", label: "Risk Analysis", icon: Shield },
   { id: "deps", label: "Dependencies", icon: Package },
   { id: "insights", label: "AI Insights", icon: Sparkles },
-  { id: "settings", label: "Settings", icon: Settings },
+  { id: "analyze", label: "Analyze", icon: Settings },
 ];
 
 const AGENT_ICONS: Record<AgentName, typeof FolderGit2> = {
@@ -316,7 +336,58 @@ function normalizeGraphPath(p: string): string {
   return p.trim().replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
 }
 
-type RiskListItem = { file?: string; severity?: string };
+type RiskListItem = {
+  file?: string;
+  severity?: string;
+  issue?: string;
+  score?: number;
+  whatIsThis?: string;
+  whyDangerous?: string;
+  howToFix?: string;
+  cvss?: number | null;
+};
+
+const FONT_IBM_PLEX = 'var(--font-ibm-plex-mono), ui-monospace, monospace';
+const FONT_OUTFIT = 'var(--font-outfit), system-ui, sans-serif';
+
+function riskSeverityUiLabel(severity: string | undefined): "CRITICAL" | "HIGH" | "MEDIUM" | "LOW" {
+  const s = (severity || "").toLowerCase();
+  if (s === "critical") return "CRITICAL";
+  if (s === "warning") return "HIGH";
+  if (s === "info") return "MEDIUM";
+  return "LOW";
+}
+
+function riskSeverityBadgeStyle(
+  label: ReturnType<typeof riskSeverityUiLabel>
+): { background: string; border: string; color: string } {
+  if (label === "CRITICAL") {
+    return {
+      background: "rgba(201,107,92,0.15)",
+      border: "1px solid rgba(201,107,92,0.35)",
+      color: "#ff5f57",
+    };
+  }
+  if (label === "HIGH") {
+    return {
+      background: "rgba(255,189,46,0.12)",
+      border: "1px solid rgba(255,189,46,0.35)",
+      color: "#ffbd2e",
+    };
+  }
+  if (label === "MEDIUM") {
+    return {
+      background: "rgba(50,95,87,0.2)",
+      border: "1px solid rgba(111,148,135,0.35)",
+      color: "#6F9487",
+    };
+  }
+  return {
+    background: "rgba(40,202,65,0.1)",
+    border: "1px solid rgba(40,202,65,0.28)",
+    color: "#28ca41",
+  };
+}
 
 function severityToRank(s: string | undefined): number {
   const x = (s || "").toLowerCase();
@@ -871,6 +942,8 @@ export default function Dashboard() {
   const [selectedMapperNode, setSelectedMapperNode] = useState<MapperNode | null>(null);
   const [activeNavId, setActiveNavId] = useState<NavId>("overview");
   const [analysisWallMs, setAnalysisWallMs] = useState<number | null>(null);
+  const [expandedRisk, setExpandedRisk] = useState<number | null>(null);
+  const [quoteIndex, setQuoteIndex] = useState(0);
 
   const handleSelectMapperNode = useCallback((node: MapperNode | null) => {
     setSelectedMapperNode(node);
@@ -903,6 +976,19 @@ export default function Dashboard() {
   useEffect(() => {
     setSelectedMapperNode(null);
   }, [results]);
+
+  useEffect(() => {
+    setExpandedRisk(null);
+  }, [results]);
+
+  useEffect(() => {
+    if (!loading) return;
+    setQuoteIndex(0);
+    const id = window.setInterval(() => {
+      setQuoteIndex((prev) => (prev + 1) % quotes.length);
+    }, 3000);
+    return () => window.clearInterval(id);
+  }, [loading]);
 
   const analyze = useCallback(async (overrideUrl?: string) => {
     const urlAnalyzing = (overrideUrl ?? repoUrl).trim();
@@ -1082,22 +1168,353 @@ export default function Dashboard() {
     });
   }, []);
 
-  const exportResultsJson = useCallback(() => {
-    if (!results || typeof window === "undefined") return;
-    const blob = new Blob([JSON.stringify(results, null, 2)], { type: "application/json" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = "stacksense-analysis.json";
-    a.click();
-    URL.revokeObjectURL(a.href);
-  }, [results]);
-
   const navTitle = NAV_ITEMS.find((n) => n.id === activeNavId)?.label ?? "Overview";
   const healthScore = results ? Number(results.scorer?.score ?? 0) : null;
 
   const kpiFiles = results?.mapper?.nodes?.length ?? 0;
   const kpiIssues = results?.risk?.risks?.length ?? 0;
   const kpiDeps = results?.auditor?.dependencies?.length ?? 0;
+
+  const exportPDF = useCallback(() => {
+    if (!results || typeof window === "undefined") return;
+    const printWindow = window.open("", "_blank");
+    if (!printWindow) return;
+
+    const escapeHtml = (s: string) =>
+      s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+    const analysisTimeSec =
+      analysisWallMs != null && analysisWallMs > 0 ? Math.round(analysisWallMs) / 1000 : 0;
+
+    const rawStr = (v: unknown) => (typeof v === "string" ? v.trim() : "");
+
+    const rawDeps = ((results.auditor as { dependencies?: unknown[] } | undefined)?.dependencies ||
+      []) as unknown[];
+    const rawRisks = ((results.risk as { risks?: unknown[] } | undefined)?.risks || []) as unknown[];
+
+    const toDepRecord = (dep: unknown): Record<string, unknown> =>
+      typeof dep === "object" && dep !== null ? { ...(dep as Record<string, unknown>) } : {};
+
+    /** Package name/version fallbacks — API may use different keys. */
+    function depPdfFields(d: Record<string, unknown>) {
+      let nameGuess =
+        rawStr(d.name) ||
+        rawStr(d.packageName) ||
+        rawStr(d.package) ||
+        rawStr(d.dependency);
+      const versionGuess =
+        rawStr(d.version) ||
+        rawStr(d.currentVersion) ||
+        rawStr(d.declaredRange) ||
+        rawStr(d.range);
+      const keys = Object.keys(d);
+
+      /* User-requested fallback: first key → value if name still empty */
+      if (!nameGuess && keys.length > 0) {
+        const k0 = keys[0];
+        const v0 = d[k0];
+        if (typeof v0 === "string" && v0.trim()) nameGuess = v0.trim();
+      }
+      /* Otherwise first plausible string-ish value excluding known metadata keys */
+      if (!nameGuess) {
+        const skip = new Set([
+          "version",
+          "currentVersion",
+          "status",
+          "severity",
+          "declaredRange",
+          "range",
+          "notes",
+          "details",
+          "kind",
+          "reason",
+          "risk",
+          "issues",
+          "description",
+          "summary",
+          "riskScore",
+        ]);
+        for (const key of keys) {
+          if (skip.has(key)) continue;
+          const v = d[key];
+          const s = typeof v === "string" ? v.trim() : typeof v === "number" ? String(v) : "";
+          if (s.length > 0 && s.length < 200 && !s.includes("\n")) {
+            nameGuess = s;
+            break;
+          }
+        }
+      }
+      nameGuess ||= "Unknown";
+
+      let stNorm = rawStr(String(d.status ?? "")).toUpperCase();
+      if (!stNorm && typeof d.severity === "string") stNorm = rawStr(d.severity).toUpperCase();
+      if (stNorm === "OKAY") stNorm = "OK";
+      if (!stNorm) stNorm = "OK";
+
+      /* Merge flattened fields PDF template expects alongside raw keys */
+      return {
+        ...d,
+        name: nameGuess,
+        packageName:
+          rawStr(d.packageName) || rawStr(d.name) || rawStr(d.package) || "",
+        version: rawStr(versionGuess),
+        currentVersion:
+          rawStr(d.currentVersion) || rawStr(d.version) || rawStr(versionGuess),
+        status: stNorm,
+      };
+    }
+
+    /** Risk rows may use alternate field names from the model JSON. */
+    function riskPdfFields(r: Record<string, unknown>) {
+      const descKeys = [
+        "issue",
+        "description",
+        "finding",
+        "findings",
+        "message",
+        "summary",
+        "title",
+        "detail",
+        "whatIsThis",
+        "what_is_this",
+        "risk",
+      ] as const;
+      let description = "";
+      for (const k of descKeys) {
+        const candidate = rawStr(r[k as string]);
+        if (candidate) {
+          description = candidate;
+          break;
+        }
+      }
+      let fileGuess =
+        rawStr(r.file) ||
+        rawStr(r.filePath) ||
+        rawStr(r.path) ||
+        rawStr(r.source) ||
+        rawStr(r.location);
+      /* Value for first usable key ending in File / Path sometimes */
+      if (!fileGuess) {
+        const pathKeys = Object.keys(r).filter(
+          (k) => /^file|^path|^source|^location|^module/i.test(k) && typeof r[k] === "string"
+        );
+        fileGuess = pathKeys.length ? rawStr(r[pathKeys[0]]) : "";
+      }
+      const severityStr = typeof r.severity === "string" ? r.severity : "";
+      const rawScore =
+        typeof r.score === "number"
+          ? r.score
+          : typeof r.score === "string"
+            ? Number(r.score)
+            : NaN;
+      let scoreDisp = "—";
+      if (Number.isFinite(rawScore)) scoreDisp = String(rawScore);
+      else if (typeof r.score === "string" && r.score.trim()) scoreDisp = r.score.trim();
+      else if (severityStr.trim()) scoreDisp = severityStr.trim().toUpperCase();
+      else if (r.cvss != null && String(r.cvss).trim())
+        scoreDisp = `CVSS ${String(r.cvss).trim()}`;
+
+      return {
+        ...r,
+        file: fileGuess || "—",
+        description:
+          description || rawStr(r.issue) || rawStr(r.whatIsThis as string | undefined),
+        summary: rawStr(r.summary),
+        issue: rawStr(r.issue),
+        score: scoreDisp,
+      };
+    }
+
+    const dependenciesForPdf = rawDeps.map(toDepRecord).map(depPdfFields);
+
+    const riskAnalysisForPdf = rawRisks
+      .map((r) => (typeof r === "object" && r !== null ? (r as Record<string, unknown>) : {}))
+      .map(riskPdfFields);
+
+    const analysisData = {
+      healthScore: Math.round(Number(results.scorer?.score ?? 0)),
+      analysisTime: analysisTimeSec,
+      filesScanned: results.mapper?.nodes?.length ?? 0,
+      issuesFound: results.risk?.risks?.length ?? 0,
+      dependencies: dependenciesForPdf,
+      riskAnalysis: riskAnalysisForPdf,
+      recommendations: Array.isArray(results.scorer?.recommendations)
+        ? (results.scorer.recommendations as string[])
+        : [],
+    };
+
+    if (analysisData.dependencies.length > 0) console.log(analysisData.dependencies[0]);
+    if (analysisData.riskAnalysis.length > 0) console.log(analysisData.riskAnalysis[0]);
+
+    const healthScoreN = analysisData.healthScore;
+    const bannerAccent =
+      healthScoreN >= 80 ? "#28ca41" : healthScoreN >= 60 ? "#ffbd2e" : "#ff5f57";
+    const healthLabel =
+      healthScoreN >= 80 ? "HEALTHY" : healthScoreN >= 60 ? "NEEDS ATTENTION" : "AT RISK";
+
+    const riskBlocks =
+      analysisData.riskAnalysis.length > 0
+        ? analysisData.riskAnalysis
+            .map(
+              (r) => `
+          <div class="finding-row">
+            <div>
+              <div class="finding-file">${escapeHtml(String(r.file))}</div>
+              <div class="finding-desc">${escapeHtml(String(r.description))}</div>
+            </div>
+            <div class="score">${escapeHtml(String(r.score !== "" ? r.score : "—"))}</div>
+          </div>
+        `
+            )
+            .join("")
+        : '<div style="color:#6F9487;font-size:13px;padding:12px">No risk findings.</div>';
+
+    const depBlocks =
+      analysisData.dependencies.length > 0
+        ? analysisData.dependencies
+            .map((entry) => {
+              const d = entry as Record<string, unknown>;
+              const firstKey = Object.keys(d)[0];
+              const firstVal = firstKey != null ? d[firstKey] : undefined;
+              const nameGuess =
+                rawStr(typeof d.name === "string" ? d.name : "") ||
+                rawStr(typeof d.packageName === "string" ? d.packageName : "") ||
+                rawStr(typeof firstVal === "string" ? String(firstVal) : "") ||
+                rawStr(firstKey ?? "");
+              const nameFinal = escapeHtml(nameGuess.trim() ? nameGuess : "Unknown");
+
+              const versionGuess =
+                rawStr(typeof d.version === "string" ? d.version : "") ||
+                rawStr(typeof d.currentVersion === "string" ? d.currentVersion : "");
+
+              let stCmp = rawStr(typeof d.status === "string" ? d.status : "").toUpperCase();
+              if (stCmp === "OKAY") stCmp = "OK";
+              if (!stCmp) stCmp = "OK";
+
+              const badgeClass =
+                stCmp === "OUTDATED"
+                  ? "badge-outdated"
+                  : stCmp === "VULNERABLE"
+                    ? "badge-vulnerable"
+                    : "badge-ok";
+              const badgeLabel = escapeHtml(stCmp);
+
+              return `
+          <div class="dep-row">
+            <span class="dep-name">${nameFinal}</span>
+            <div style="display:flex;align-items:center;gap:12px">
+              <span class="dep-version">${escapeHtml(versionGuess)}</span>
+              <span class="badge ${badgeClass}">${badgeLabel}</span>
+            </div>
+          </div>
+        `;
+            })
+            .join("")
+        : '<div style="color:#6F9487;font-size:13px;padding:12px">No dependencies found.</div>';
+
+    const recBlocks =
+      analysisData.recommendations.length > 0
+        ? analysisData.recommendations
+            .map((rec) => {
+              const t = escapeHtml(String(rec));
+              return `<div style="padding:10px 0;border-bottom:1px solid #163E3C;font-size:13px;color:#b8d4c8">● ${t}</div>`;
+            })
+            .join("")
+        : '<div style="color:#6F9487;font-size:13px;padding:12px">No recommendations.</div>';
+
+    printWindow.document.write(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>StackSense Security Report</title>
+      <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Courier New', monospace; background: #04151A; color: #d4e8df; padding: 40px; }
+        .header { border-bottom: 2px solid #325F57; padding-bottom: 24px; margin-bottom: 32px; }
+        .logo { font-size: 24px; font-weight: 700; letter-spacing: -0.02em; margin-bottom: 8px; color: #ffffff; }
+        .logo .logo-teal,
+        .logo > span.logo-teal,
+        .logo span.logo-teal { color: #325F57 !important; }
+        .meta { font-size: 11px; color: #6F9487; letter-spacing: 0.1em; }
+        .repo-url { font-size: 13px; color: #325F57; margin-top: 8px; }
+        .health-banner { background: #092828; border: 1px solid #163E3C; border-left: 4px solid ${bannerAccent}; border-radius: 8px; padding: 20px 24px; margin-bottom: 32px; display: flex; justify-content: space-between; align-items: center; }
+        .health-score { font-size: 48px; font-weight: 700; color: ${bannerAccent}; }
+        .health-label { font-size: 12px; color: #6F9487; letter-spacing: 0.1em; margin-top: 4px; }
+        .stats-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 32px; }
+        .stat-card { background: #092828; border: 1px solid #163E3C; border-radius: 8px; padding: 16px; }
+        .stat-num { font-size: 28px; font-weight: 700; color: #ffffff; margin-bottom: 4px; }
+        .stat-label { font-size: 11px; color: #6F9487; letter-spacing: 0.08em; }
+        .section { margin-bottom: 32px; }
+        .section-title { font-size: 11px; color: #325F57; letter-spacing: 0.15em; border-left: 2px solid #325F57; padding-left: 12px; margin-bottom: 16px; }
+        .finding-row { background: #092828; border: 1px solid #163E3C; border-radius: 6px; padding: 14px 16px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: flex-start; }
+        .finding-file { font-size: 13px; color: #ffffff; font-weight: 600; margin-bottom: 4px; }
+        .finding-desc { font-size: 12px; color: #b8d4c8; line-height: 1.5; max-width: 75%; }
+        .score { font-size: 14px; font-weight: 700; color: #ffbd2e; }
+        .badge { font-size: 10px; padding: 3px 8px; border-radius: 4px; font-weight: 600; letter-spacing: 0.08em; }
+        .badge-outdated { background: rgba(255,189,46,0.15); color: #ffbd2e; }
+        .badge-ok { background: rgba(40,202,65,0.15); color: #28ca41; }
+        .badge-vulnerable { background: rgba(255,95,87,0.15); color: #ff5f57; }
+        .dep-row { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid #163E3C; font-size: 13px; }
+        .dep-name { color: #ffffff; }
+        .dep-version { color: #6F9487; margin-right: 12px; }
+        .footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid #163E3C; display: flex; justify-content: space-between; font-size: 11px; color: #6F9487; letter-spacing: 0.06em; }
+        @media print { body { -webkit-print-color-adjust: exact; print-color-adjust: exact; } }
+      </style>
+    </head>
+    <body>
+      <div class="header">
+        <div class="logo">Stack<span class="logo-teal">Sense</span></div>
+        <div class="meta">SECURITY ANALYSIS REPORT · GENERATED ${escapeHtml(new Date().toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" }))} · ${escapeHtml(new Date().toLocaleTimeString("en-US", { hour12: true }))}</div>
+        <div class="repo-url">▸ ${escapeHtml(repoUrl.trim() || "Repository Analysis")}</div>
+      </div>
+
+      <div class="health-banner">
+        <div>
+          <div style="font-size:12px;color:#6F9487;letter-spacing:0.1em;margin-bottom:8px">OVERALL HEALTH SCORE</div>
+          <div class="health-score">${healthScoreN}<span style="font-size:24px;color:#6F9487">/100</span></div>
+          <div class="health-label">${healthLabel}</div>
+        </div>
+        <div style="text-align:right">
+          <div style="font-size:11px;color:#6F9487;margin-bottom:8px">SCAN COMPLETED IN</div>
+          <div style="font-size:32px;color:#ffffff;font-weight:700">${analysisTimeSec}<span style="font-size:18px;color:#6F9487">s</span></div>
+        </div>
+      </div>
+
+      <div class="stats-row">
+        <div class="stat-card"><div class="stat-num">${analysisData.filesScanned}</div><div class="stat-label">FILES SCANNED</div></div>
+        <div class="stat-card"><div class="stat-num" style="color:#ff5f57">${analysisData.issuesFound}</div><div class="stat-label">ISSUES FOUND</div></div>
+        <div class="stat-card"><div class="stat-num" style="color:#ffbd2e">${analysisData.dependencies.length}</div><div class="stat-label">DEPENDENCIES</div></div>
+        <div class="stat-card"><div class="stat-num" style="color:#325F57">${analysisData.analysisTime}<span style="font-size:16px;color:#6F9487">s</span></div><div class="stat-label">ANALYSIS TIME</div></div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">▸ RISK ANALYSIS</div>
+        ${riskBlocks}
+      </div>
+
+      <div class="section">
+        <div class="section-title">▸ DEPENDENCY AUDIT</div>
+        ${depBlocks}
+      </div>
+
+      <div class="section">
+        <div class="section-title">▸ AI RECOMMENDATIONS</div>
+        ${recBlocks}
+      </div>
+
+      <div class="footer">
+        <span>StackSense · AI-powered codebase intelligence · BeaverHacks 2026</span>
+        <span>stacksense.app · Powered by Google Gemini AI</span>
+      </div>
+    </body>
+    </html>
+  `);
+    printWindow.document.close();
+    window.setTimeout(() => {
+      printWindow.print();
+      printWindow.close();
+    }, 500);
+  }, [results, repoUrl, analysisWallMs]);
 
   return (
     <main
@@ -1109,10 +1526,8 @@ export default function Dashboard() {
         fontFamily: "system-ui",
         position: "relative",
         color: TEXT_DESC,
-        opacity: analyzeUi.open && !analyzeUi.exiting ? 0.28 : 1,
-        filter: analyzeUi.open && !analyzeUi.exiting ? "blur(10px)" : "none",
-        transition: "opacity 0.55s cubic-bezier(0.4, 0, 0.2, 1), filter 0.55s cubic-bezier(0.4, 0, 0.2, 1)",
-        pointerEvents: analyzeUi.open && !analyzeUi.exiting ? "none" : "auto",
+        opacity: 1,
+        filter: "none",
       }}
     >
       {analyzeUi.open ? (
@@ -1123,17 +1538,15 @@ export default function Dashboard() {
             left: 0,
             right: 0,
             bottom: 0,
-            minHeight: "100vh",
             background: "#04151A",
+            zIndex: 9999,
             display: "flex",
             flexDirection: "column",
             alignItems: "center",
             justifyContent: "center",
             gap: "2rem",
-            zIndex: 9999,
-            opacity: analyzeUi.exiting ? 0 : 1,
-            transition: "opacity 0.58s cubic-bezier(0.33, 1, 0.68, 1)",
-            pointerEvents: analyzeUi.exiting ? "none" : "auto",
+            opacity: 1,
+            filter: "none",
           }}
         >
           <div style={{ textAlign: "center" }}>
@@ -1281,6 +1694,47 @@ export default function Dashboard() {
               }}
             >
               Scanning repository...
+            </div>
+          </div>
+
+          <div
+            style={{
+              maxWidth: "440px",
+              width: "100%",
+              marginTop: "2rem",
+              padding: "1.5rem",
+              background: "#092828",
+              border: "1px solid #163E3C",
+              borderRadius: "8px",
+              borderLeft: "3px solid #325F57",
+              transition: "all 0.5s ease",
+            }}
+          >
+            <div
+              style={{
+                fontFamily: "IBM Plex Mono, monospace",
+                fontSize: "10px",
+                color: "#325F57",
+                letterSpacing: "0.1em",
+                marginBottom: "8px",
+              }}
+            >
+              ▸ DID YOU KNOW
+            </div>
+            <div
+              style={{
+                fontFamily: "DM Serif Display, serif",
+                fontSize: "18px",
+                color: "#ffffff",
+                fontStyle: "italic",
+                lineHeight: 1.5,
+                marginBottom: "8px",
+              }}
+            >
+              {`"${quotes[quoteIndex].quote}"`}
+            </div>
+            <div style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: "10px", color: "#6F9487" }}>
+              — {quotes[quoteIndex].source}
             </div>
           </div>
 
@@ -1440,7 +1894,7 @@ export default function Dashboard() {
               )}
               <button
                 type="button"
-                onClick={exportResultsJson}
+                onClick={exportPDF}
                 disabled={!results}
                 style={{
                   display: "inline-flex",
@@ -1478,6 +1932,82 @@ export default function Dashboard() {
                 {error}
               </div>
             ) : null}
+
+            <section id="section-analyze" style={{ scrollMarginTop: 8 }}>
+              <div
+                style={{
+                  background: "#092828",
+                  border: "1px solid #163E3C",
+                  borderRadius: "12px",
+                  padding: "1.5rem 2rem",
+                  marginBottom: "2rem",
+                }}
+              >
+                <div
+                  style={{
+                    fontFamily: "IBM Plex Mono, monospace",
+                    fontSize: 11,
+                    color: "#325F57",
+                    marginBottom: 8,
+                    letterSpacing: "0.06em",
+                  }}
+                >
+                  ▸ ANALYZE A REPOSITORY
+                </div>
+                <div style={{ display: "flex", width: "100%", alignItems: "stretch", marginBottom: 10 }}>
+                  <input
+                    className="dashboard-url-input"
+                    value={repoUrl}
+                    onChange={(e) => setRepoUrl(e.target.value)}
+                    placeholder="github.com/owner/repo"
+                    style={{
+                      flex: 1,
+                      minWidth: 0,
+                      boxSizing: "border-box",
+                      background: "#04151A",
+                      border: "1px solid #325F57",
+                      borderRight: "none",
+                      borderRadius: "8px 0 0 8px",
+                      padding: "14px 16px",
+                      fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, monospace",
+                      fontSize: 13,
+                      color: "#b8d4c8",
+                      outline: "none",
+                    }}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => void analyze()}
+                    disabled={loading || !repoUrl.trim()}
+                    style={{
+                      flexShrink: 0,
+                      background: "#325F57",
+                      color: "#04151A",
+                      fontSize: 15,
+                      fontWeight: 600,
+                      border: "1px solid #325F57",
+                      borderRadius: "0 8px 8px 0",
+                      padding: "14px 24px",
+                      cursor: loading || !repoUrl.trim() ? "not-allowed" : "pointer",
+                      opacity: loading || !repoUrl.trim() ? 0.5 : 1,
+                    }}
+                  >
+                    {loading ? "Analyzing…" : "Analyze →"}
+                  </button>
+                </div>
+                <div
+                  style={{
+                    fontFamily: "IBM Plex Mono, monospace",
+                    fontSize: 11,
+                    color: "#6F9487",
+                    opacity: 0.5,
+                    lineHeight: 1.5,
+                  }}
+                >
+                  No account needed · Read-only access · Results in 60 seconds
+                </div>
+              </div>
+            </section>
 
             <section id="section-overview" style={{ scrollMarginTop: 8, marginBottom: 32 }}>
               <div
@@ -1908,59 +2438,228 @@ export default function Dashboard() {
               >
                 risk analysis
               </div>
-              {results.risk?.risks?.slice(0, 6).map((risk: any, i: number) => (
-                <div
-                  key={i}
-                  style={{
-                    display: "flex",
-                    alignItems: "flex-start",
-                    gap: "10px",
-                    padding: "12px",
-                    background: "rgba(22,62,60,0.25)",
-                    borderRadius: 12,
-                    marginBottom: "8px",
-                    border: `1px solid ${
-                      risk.severity === "critical" ? "rgba(201,107,92,0.35)" : "rgba(217,162,60,0.28)"
-                    }`,
-                    backdropFilter: "blur(8px)",
-                  }}
-                >
+              {results.risk?.risks?.slice(0, 6).map((risk: RiskListItem, i: number) => {
+                const expanded = expandedRisk === i;
+                const sevLabel = riskSeverityUiLabel(risk.severity);
+                const badgeChrome = riskSeverityBadgeStyle(sevLabel);
+                const cvss =
+                  typeof risk.cvss === "number" && Number.isFinite(risk.cvss)
+                    ? Math.round(risk.cvss * 10) / 10
+                    : null;
+                const whatText = (risk.whatIsThis || "").trim() || "—";
+                const whyText = (risk.whyDangerous || "").trim() || "—";
+                const fixText = (risk.howToFix || "").trim() || "// No fix snippet returned for this finding.";
+                return (
                   <div
+                    key={i}
                     style={{
-                      width: 8,
-                      height: 8,
-                      borderRadius: "50%",
-                      background: risk.severity === "critical" ? DANGER : WARNING,
-                      marginTop: 4,
-                      flexShrink: 0,
-                      boxShadow: `0 0 12px ${risk.severity === "critical" ? DANGER : WARNING}66`,
-                    }}
-                  />
-                  <div style={{ minWidth: 0 }}>
-                    <div
-                      style={{
-                        fontSize: 14,
-                        fontWeight: 500,
-                        color: TEXT_HEADING,
-                        fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, monospace",
-                      }}
-                    >
-                      {risk.file}
-                    </div>
-                    <div style={{ fontSize: 15, color: TEXT_DESC, marginTop: 4, lineHeight: 1.6 }}>{risk.issue}</div>
-                  </div>
-                  <span
-                    style={{
-                      marginLeft: "auto",
-                      fontSize: 14,
-                      fontWeight: 600,
-                      color: risk.severity === "critical" ? DANGER : WARNING,
+                      borderRadius: 12,
+                      marginBottom: 8,
+                      border: `1px solid ${
+                        risk.severity === "critical" ? "rgba(201,107,92,0.35)" : "rgba(217,162,60,0.28)"
+                      }`,
+                      background: "rgba(22,62,60,0.25)",
+                      backdropFilter: "blur(8px)",
+                      overflow: "hidden",
                     }}
                   >
-                    {risk.score}
-                  </span>
-                </div>
-              ))}
+                    <button
+                      type="button"
+                      onClick={() => setExpandedRisk(expanded ? null : i)}
+                      aria-expanded={expanded}
+                      style={{
+                        display: "flex",
+                        alignItems: "flex-start",
+                        gap: 10,
+                        padding: 12,
+                        width: "100%",
+                        border: "none",
+                        background: "transparent",
+                        cursor: "pointer",
+                        textAlign: "left",
+                        color: "inherit",
+                        boxSizing: "border-box",
+                      }}
+                    >
+                      <div
+                        style={{
+                          width: 8,
+                          height: 8,
+                          borderRadius: "50%",
+                          background: risk.severity === "critical" ? DANGER : WARNING,
+                          marginTop: 4,
+                          flexShrink: 0,
+                          boxShadow: `0 0 12px ${risk.severity === "critical" ? DANGER : WARNING}66`,
+                        }}
+                      />
+                      <div style={{ minWidth: 0, flex: 1 }}>
+                        <div
+                          style={{
+                            fontSize: 14,
+                            fontWeight: 500,
+                            color: TEXT_HEADING,
+                            fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, monospace",
+                          }}
+                        >
+                          {risk.file}
+                        </div>
+                        <div style={{ fontSize: 15, color: TEXT_DESC, marginTop: 4, lineHeight: 1.6 }}>
+                          {risk.issue}
+                        </div>
+                      </div>
+                      <span
+                        style={{
+                          fontSize: 14,
+                          fontWeight: 600,
+                          color: risk.severity === "critical" ? DANGER : WARNING,
+                          flexShrink: 0,
+                          marginTop: 2,
+                        }}
+                      >
+                        {risk.score != null ? risk.score : "—"}
+                      </span>
+                      <span
+                        aria-hidden
+                        style={{
+                          flexShrink: 0,
+                          marginTop: 2,
+                          fontSize: 12,
+                          color: TEXT_LABEL,
+                          display: "inline-flex",
+                          alignItems: "center",
+                          transform: expanded ? "rotate(0deg)" : "rotate(-90deg)",
+                          transition: "transform 0.3s ease",
+                        }}
+                      >
+                        ▼
+                      </span>
+                    </button>
+                    <div
+                      style={{
+                        maxHeight: expanded ? 3200 : 0,
+                        transition: "max-height 0.45s cubic-bezier(0.4, 0, 0.2, 1)",
+                        overflow: "hidden",
+                      }}
+                    >
+                      <div
+                        style={{
+                          background: "#04151A",
+                          borderTop: "1px solid #163E3C",
+                          padding: "1.5rem",
+                        }}
+                      >
+                        <div style={{ marginBottom: 20 }}>
+                          <div
+                            style={{
+                              fontFamily: FONT_IBM_PLEX,
+                              fontSize: 11,
+                              letterSpacing: "0.06em",
+                              color: "#325F57",
+                              fontWeight: 600,
+                              marginBottom: 8,
+                            }}
+                          >
+                            WHAT IS THIS?
+                          </div>
+                          <p
+                            style={{
+                              fontFamily: FONT_OUTFIT,
+                              fontSize: 14,
+                              color: "#b8d4c8",
+                              lineHeight: 1.65,
+                              margin: 0,
+                            }}
+                          >
+                            {whatText}
+                          </p>
+                        </div>
+                        <div style={{ marginBottom: 20 }}>
+                          <div
+                            style={{
+                              fontFamily: FONT_IBM_PLEX,
+                              fontSize: 11,
+                              letterSpacing: "0.06em",
+                              color: "#ff5f57",
+                              fontWeight: 600,
+                              marginBottom: 8,
+                            }}
+                          >
+                            WHY IT&apos;S DANGEROUS
+                          </div>
+                          <p
+                            style={{
+                              fontFamily: FONT_OUTFIT,
+                              fontSize: 14,
+                              color: "#b8d4c8",
+                              lineHeight: 1.65,
+                              margin: 0,
+                            }}
+                          >
+                            {whyText}
+                          </p>
+                        </div>
+                        <div style={{ marginBottom: 20 }}>
+                          <div
+                            style={{
+                              fontFamily: FONT_IBM_PLEX,
+                              fontSize: 11,
+                              letterSpacing: "0.06em",
+                              color: "#28ca41",
+                              fontWeight: 600,
+                              marginBottom: 8,
+                            }}
+                          >
+                            HOW TO FIX IT
+                          </div>
+                          <pre
+                            style={{
+                              margin: 0,
+                              padding: "0.75rem",
+                              borderRadius: 8,
+                              background: "#04151A",
+                              border: "1px solid #163E3C",
+                              fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace',
+                              fontSize: 13,
+                              color: "#b8d4c8",
+                              whiteSpace: "pre-wrap",
+                              wordBreak: "break-word",
+                              lineHeight: 1.5,
+                            }}
+                          >
+                            {fixText}
+                          </pre>
+                        </div>
+                        <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 10 }}>
+                          <span
+                            style={{
+                              fontSize: 11,
+                              fontWeight: 700,
+                              letterSpacing: "0.08em",
+                              textTransform: "uppercase",
+                              padding: "4px 12px",
+                              borderRadius: 20,
+                              ...badgeChrome,
+                            }}
+                          >
+                            {sevLabel}
+                          </span>
+                          {cvss != null ? (
+                            <span
+                              style={{
+                                fontFamily: FONT_IBM_PLEX,
+                                fontSize: 12,
+                                color: TEXT_META,
+                              }}
+                            >
+                              CVSS {cvss.toFixed(1)}
+                            </span>
+                          ) : null}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           </section>
 
@@ -2029,65 +2728,6 @@ export default function Dashboard() {
           </section>
         </>
       )}
-
-      <section id="section-settings" style={{ scrollMarginTop: 8, marginBottom: 48 }}>
-        <div
-          style={{
-            fontSize: 13,
-            fontWeight: 700,
-            letterSpacing: "0.12em",
-            color: TEXT_LABEL,
-            textTransform: "uppercase",
-            marginBottom: 14,
-          }}
-        >
-          Settings
-        </div>
-        <div className="stacksense-glass-card" style={{ padding: 22, maxWidth: 560 }}>
-          <p style={{ color: TEXT_DESC, fontSize: 15, margin: "0 0 16px", lineHeight: 1.6 }}>
-            Paste a public GitHub repository URL to analyze.
-          </p>
-          <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
-            <input
-              className="dashboard-url-input"
-              value={repoUrl}
-              onChange={(e) => setRepoUrl(e.target.value)}
-              placeholder="github.com/owner/repo"
-              style={{
-                flex: 1,
-                minWidth: 200,
-                ...glassPanel,
-                padding: "12px 16px",
-                color: TEXT_HEADING,
-                fontSize: 15,
-                fontFamily: "ui-monospace, monospace",
-                outline: "none",
-              }}
-            />
-            <button
-              type="button"
-              onClick={() => void analyze()}
-              disabled={loading || !repoUrl.trim()}
-              style={{
-                padding: "12px 22px",
-                borderRadius: 12,
-                border: `1px solid ${GLASS_BORDER}`,
-                background: BUTTON_BG,
-                color: TEXT_HEADING,
-                fontSize: 16,
-                fontWeight: 600,
-                cursor: loading || !repoUrl.trim() ? "not-allowed" : "pointer",
-                opacity: loading || !repoUrl.trim() ? 0.45 : 1,
-              }}
-            >
-              {loading ? "Analyzing…" : "Analyze"}
-            </button>
-          </div>
-          <a href="/" style={{ display: "inline-block", marginTop: 16, color: TEXT_META, fontSize: 13 }}>
-            ← Back to home
-          </a>
-        </div>
-      </section>
 
           </div>
         </div>

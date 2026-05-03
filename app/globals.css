@@ -129,58 +129,6 @@
   }
 }
 
-/* StackSense analyzing overlay progress shimmer */
-@keyframes stacksense-analyze-shimmer {
-  0% {
-    transform: translateX(-120%);
-  }
-  100% {
-    transform: translateX(120%);
-  }
-}
-
-.stacksense-analyze-progress-shimmer {
-  position: absolute;
-  inset: 0;
-  width: 40%;
-  background: linear-gradient(
-    105deg,
-    transparent 0%,
-    rgba(50, 95, 87, 0.45) 40%,
-    rgba(111, 148, 135, 0.28) 55%,
-    transparent 90%
-  );
-  animation: stacksense-analyze-shimmer 1.35s ease-in-out infinite;
-  pointer-events: none;
-}
-
-@keyframes stacksense-overlay-spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
-
-.stacksense-overlay-spinner {
-  animation: stacksense-overlay-spin 0.9s linear infinite;
-  transform-origin: center;
-}
-
-@keyframes stacksense-overlay-pulse-ring {
-  0%,
-  100% {
-    opacity: 0.35;
-    transform: scale(1);
-  }
-  50% {
-    opacity: 0.9;
-    transform: scale(1.06);
-  }
-}
-
-.stacksense-overlay-pulse-ring {
-  animation: stacksense-overlay-pulse-ring 2.2s ease-in-out infinite;
-}
-
 .dashboard-nav-btn:hover {
   background: rgba(111, 148, 135, 0.08) !important;
 }

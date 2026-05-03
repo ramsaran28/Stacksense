@@ -123,6 +123,76 @@ function normalizeScorerPayload(raw: unknown, fallback: ScorerShape): ScorerShap
   };
 }
 
+type NormalizedRisk = {
+  file: string;
+  severity: string;
+  issue: string;
+  score: number;
+  whatIsThis: string;
+  whyDangerous: string;
+  howToFix: string;
+  cvss: number | null;
+};
+
+type RiskAgentPayload = { risks: NormalizedRisk[]; summary: string };
+
+function coerceRiskCvss(raw: unknown): number | null {
+  if (raw == null) return null;
+  const n = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(n)) return null;
+  return Math.min(10, Math.max(0, Math.round(n * 10) / 10));
+}
+
+function coerceRiskScore(raw: unknown): number {
+  const n = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(n)) return 50;
+  return Math.min(100, Math.max(0, Math.round(n)));
+}
+
+/**
+ * Ensures Gemini risk rows always include explanatory fields for the dashboard expander UI.
+ */
+function normalizeRiskItems(risks: unknown): NormalizedRisk[] {
+  if (!Array.isArray(risks)) return [];
+  const out: NormalizedRisk[] = [];
+  for (const r of risks) {
+    if (!r || typeof r !== "object") continue;
+    const o = r as Record<string, unknown>;
+    const file = typeof o.file === "string" ? o.file : "";
+    const issue = typeof o.issue === "string" ? o.issue : "";
+    const severity = typeof o.severity === "string" ? o.severity : "info";
+    const whatIsThis =
+      typeof o.whatIsThis === "string"
+        ? o.whatIsThis
+        : typeof o.what_is_this === "string"
+          ? o.what_is_this
+          : "";
+    const whyDangerous =
+      typeof o.whyDangerous === "string"
+        ? o.whyDangerous
+        : typeof o.why_dangerous === "string"
+          ? o.why_dangerous
+          : "";
+    const howToFix =
+      typeof o.howToFix === "string"
+        ? o.howToFix
+        : typeof o.how_to_fix === "string"
+          ? o.how_to_fix
+          : "";
+    out.push({
+      file,
+      severity,
+      issue,
+      score: coerceRiskScore(o.score),
+      whatIsThis,
+      whyDangerous,
+      howToFix,
+      cvss: coerceRiskCvss(o.cvss),
+    });
+  }
+  return out;
+}
+
 function heuristicScorerFallback(params: {
   filesMapped: number;
   risksCount: number;
@@ -313,10 +383,31 @@ Return this exact JSON structure:
         const riskPrompt = `You are a risk detector. Analyze this codebase for issues. Return ONLY valid JSON.
 Files analyzed: ${JSON.stringify(fileContents.map(f => ({ path: f.path, preview: f.content.slice(0, 200) })))}
 
-Return this exact JSON:
+For EVERY risk in "risks", you MUST fill these fields using plain English tailored to that specific finding (derive from "issue" and file context):
+- "whatIsThis": 1–3 sentences explaining the vulnerability/issue type for a non-specialist reader.
+- "whyDangerous": 1–3 sentences describing real-world impact for users, data, or operations.
+- "howToFix": a concrete code snippet (or shell/config snippet when code is not applicable) that fixes or mitigates the issue — use the project's apparent language/stack. No markdown fences inside the string; escape quotes as needed in JSON.
+
+Also optionally set "cvss" to an estimated CVSS 3.x base score number from 0.0–10.0 when the issue resembles a CVE-class vulnerability; omit or null for pure code smells.
+
+Example for issue "Use of md5 for hashing passwords":
+whatIsThis should explain that MD5 is broken for password storage and that passwords need slow adaptive hashing.
+whyDangerous should describe fast offline cracking and account takeover risk.
+howToFix should show bcrypt/scrypt/argon2 replacing MD5 calls (realistic code for the stack).
+
+Return this exact JSON shape (field names camelCase):
 {
   "risks": [
-    {"file": "filename", "severity": "critical|warning|info", "issue": "description", "score": 85}
+    {
+      "file": "filename",
+      "severity": "critical|warning|info",
+      "issue": "short title or description",
+      "score": 85,
+      "whatIsThis": "plain English explanation",
+      "whyDangerous": "impact explanation",
+      "howToFix": "single fix snippet as a string (can include newlines)",
+      "cvss": 7.5
+    }
   ],
   "summary": "brief summary"
 }`;
@@ -355,12 +446,18 @@ Return ONLY valid JSON:
           auditorModel.generateContent(auditorPrompt),
         ]);
 
-        let riskData = { risks: [], summary: "Analysis complete" };
+        let riskData: RiskAgentPayload = { risks: [], summary: "Analysis complete" };
         let auditData = { dependencies: [], summary: "Audit complete" };
 
         try {
           const riskMatch = riskResult.response.text().match(/\{[\s\S]*\}/);
-          if (riskMatch) riskData = JSON.parse(riskMatch[0]);
+          if (riskMatch) {
+            const raw = JSON.parse(riskMatch[0]) as Record<string, unknown>;
+            riskData = {
+              risks: normalizeRiskItems(raw.risks),
+              summary: typeof raw.summary === "string" ? raw.summary : "Analysis complete",
+            };
+          }
         } catch {}
 
         try {
