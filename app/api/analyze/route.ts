@@ -1,8 +1,131 @@
-import { GoogleGenerativeAI } from "@google/generative-ai";
 import { Octokit } from "@octokit/rest";
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
 const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
+
+const SCORER_SYSTEM_INSTRUCTION = `You are a security scoring engine. Score this codebase on a scale of 0-100 based on these strict rules:
+- Start at 100
+- Subtract 15 points for each CRITICAL vulnerability
+- Subtract 8 points for each HIGH vulnerability  
+- Subtract 3 points for each outdated dependency
+- Subtract 5 points for high coupling
+- Subtract 5 points for high dead code
+- Never go below 10
+- Never give above 85 for a repo with known CVEs
+- Be consistent — same inputs should give similar outputs
+
+Return only the JSON score object, no explanation.`;
+
+const FETCH_TIMEOUT_MS = 30_000;
+
+const ANALYSIS_SOURCE_FILE_CAP = 50;
+const RISK_TOP_FILES_BY_SIZE = 20;
+
+/** Non-stream REST fetch with 30s abort (explicit timeout + clearTimer). */
+async function fetchWithAbortTimeout(
+  input: RequestInfo | URL,
+  init: RequestInit = {}
+): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    return await fetch(input, {
+      ...init,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function geminiGenerateContentUrl() {
+  return `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`;
+}
+
+type GeminiRESTResult = { ok: boolean; status: number; text: string };
+
+/**
+ * Gemini REST `generateContent` — same payload for mapper, risk, auditor, scorer, insights.
+ */
+async function geminiREST(
+  prompt: string,
+  options?: { systemInstruction?: string }
+): Promise<GeminiRESTResult> {
+  const body: Record<string, unknown> = {
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: { maxOutputTokens: 500, temperature: 0.2 },
+  };
+  if (options?.systemInstruction) {
+    body.systemInstruction = {
+      parts: [{ text: options.systemInstruction }],
+    };
+  }
+  const response = await fetchWithAbortTimeout(geminiGenerateContentUrl(), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = (await response.json()) as {
+    candidates?: { content?: { parts?: { text?: string }[] } }[];
+  };
+  console.log("Gemini status:", response.status);
+  const text = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "{}";
+  return { ok: response.ok, status: response.status, text };
+}
+
+async function geminiGenerateContent(
+  prompt: string,
+  options?: { systemInstruction?: string }
+): Promise<string> {
+  const r = await geminiREST(prompt, options);
+  return r.text;
+}
+
+async function octokitWithTimeout<T>(
+  fn: (signal: AbortSignal) => Promise<T>
+): Promise<T> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    return await fn(controller.signal);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function countRiskSeverities(risks: readonly { severity: string }[]): {
+  critical: number;
+  high: number;
+  warning: number;
+  other: number;
+} {
+  const out = { critical: 0, high: 0, warning: 0, other: 0 };
+  for (const r of risks) {
+    const s = String(r.severity || "").toLowerCase();
+    if (s.includes("critical")) out.critical++;
+    else if (s.includes("high")) out.high++;
+    else if (s.includes("warning") || s === "medium") out.warning++;
+    else out.other++;
+  }
+  return out;
+}
+
+function countDepStatuses(deps: unknown[]): {
+  vulnerable: number;
+  outdated: number;
+  ok: number;
+  other: number;
+} {
+  const out = { vulnerable: 0, outdated: 0, ok: 0, other: 0 };
+  for (const d of deps) {
+    const o = (d ?? {}) as Record<string, unknown>;
+    const st = String(o.status ?? "").toLowerCase();
+    if (st === "vulnerable") out.vulnerable++;
+    else if (st === "outdated") out.outdated++;
+    else if (st === "ok") out.ok++;
+    else out.other++;
+  }
+  return out;
+}
 
 /** Source files pulled from the repo tree for mapper/risk. Note: `*.cpp` also ends with `.c`, so `.c` is handled separately. */
 function isAllowedSourceBlobPath(path: string | undefined): boolean {
@@ -319,16 +442,33 @@ export async function POST(req: Request) {
         // ── AGENT 1: MAPPER ──────────────────────────────
         send({ agent: "mapper", status: "running", msg: "Reading repository files..." });
 
-        const { data: tree } = await octokit.git.getTree({
-          owner,
-          repo,
-          tree_sha: "HEAD",
-          recursive: "true",
-        });
+        const tree = (
+          await octokitWithTimeout((signal) =>
+            octokit.git.getTree({
+              owner,
+              repo,
+              tree_sha: "HEAD",
+              recursive: "true",
+              request: { signal },
+            })
+          )
+        ).data;
 
-        const files = tree.tree
+        type MappedBlob = { path: string; size: number };
+
+        const allSourceBlobs: MappedBlob[] = tree.tree
           .filter((f) => f.type === "blob" && isAllowedSourceBlobPath(f.path))
-          .slice(0, 30);
+          .map((f) => ({
+            path: f.path!,
+            size: typeof f.size === "number" ? f.size : 0,
+          }));
+
+        const mappedFilePool = allSourceBlobs.slice(0, ANALYSIS_SOURCE_FILE_CAP);
+        const mapperPaths = mappedFilePool.map((f) => f.path);
+
+        const riskSourceFiles: MappedBlob[] = [...allSourceBlobs]
+          .sort((a, b) => b.size - a.size)
+          .slice(0, RISK_TOP_FILES_BY_SIZE);
 
         const packageJsonBlobPaths = tree.tree
           .filter(
@@ -376,28 +516,10 @@ export async function POST(req: Request) {
                 ? "java-gradle"
                 : "unknown";
 
-        const fileContents: { path: string; content: string }[] = [];
-        
-        for (const file of files.slice(0, 15)) {
-          try {
-            const { data: blob } = await octokit.repos.getContent({
-              owner,
-              repo,
-              path: file.path!,
-            });
-            if ("content" in blob) {
-              const content = Buffer.from(blob.content, "base64").toString("utf-8");
-              fileContents.push({ path: file.path!, content: content.slice(0, 500) });
-            }
-          } catch {}
-        }
-
-        const mapperModel = genAI.getGenerativeModel({
-          model: "gemini-2.5-flash",
-        });
-        const mapperPrompt = `You are a codebase mapper. Analyze these files and return ONLY valid JSON.
+        const mapperPrompt = `You are a codebase mapper. Infer module relationships from file paths and names only (no file bodies). Return ONLY valid JSON.
 Project type: ${projectType}
-Files: ${JSON.stringify(fileContents.map(f => f.path))}
+File paths (first ${ANALYSIS_SOURCE_FILE_CAP} source files from tree):
+${JSON.stringify(mapperPaths)}
 
 Return this exact JSON structure:
 {
@@ -406,16 +528,24 @@ Return this exact JSON structure:
   "summary": "brief summary"
 }`;
 
-        const mapperResult = await mapperModel.generateContent(mapperPrompt);
-        const mapperText = mapperResult.response.text();
+        const mapperText = await geminiGenerateContent(mapperPrompt);
         
-        let mapperData = { nodes: [], edges: [], summary: `Mapped ${files.length} files` };
+        let mapperData = {
+          nodes: [],
+          edges: [],
+          summary: `Mapped ${mapperPaths.length} files`,
+        };
         try {
           const jsonMatch = mapperText.match(/\{[\s\S]*\}/);
           if (jsonMatch) mapperData = JSON.parse(jsonMatch[0]);
         } catch {}
 
-        send({ agent: "mapper", status: "done", data: mapperData, msg: `Mapped ${files.length} files successfully` });
+        send({
+          agent: "mapper",
+          status: "done",
+          data: mapperData,
+          msg: `Mapped ${mapperPaths.length} files successfully`,
+        });
 
         type PkgDepEntry = { name: string; range: string; kind: string; fromPath: string };
         const auditorPackageJsonPaths: string[] = [];
@@ -438,13 +568,16 @@ Return this exact JSON structure:
           }
         };
 
-        for (const pkgPath of packageJsonBlobPaths.slice(0, 6)) {
+        for (const pkgPath of packageJsonBlobPaths.slice(0, 1)) {
           try {
-            const { data: blob } = await octokit.repos.getContent({
-              owner,
-              repo,
-              path: pkgPath,
-            });
+            const { data: blob } = await octokitWithTimeout((signal) =>
+              octokit.repos.getContent({
+                owner,
+                repo,
+                path: pkgPath,
+                request: { signal },
+              })
+            );
             if (!("content" in blob)) continue;
 
             const raw = Buffer.from(blob.content, "base64").toString("utf-8");
@@ -456,7 +589,7 @@ Return this exact JSON structure:
             };
 
             auditorPackageJsonPaths.push(pkgPath);
-            auditorManifestSnippets.push({ path: pkgPath, preview: raw.slice(0, 4000) });
+            auditorManifestSnippets.push({ path: pkgPath, preview: raw.slice(0, 3200) });
             recordDeps(pkg.dependencies, "dependencies", pkgPath);
             recordDeps(pkg.devDependencies, "devDependencies", pkgPath);
             recordDeps(pkg.peerDependencies, "peerDependencies", pkgPath);
@@ -483,9 +616,10 @@ Return this exact JSON structure:
             }
           };
 
-          // Root pom.xml via GitHub contents API fetch (as requested).
+          // Single primary pom.xml (root API first, else first path in tree).
+          let loadedPom = false;
           try {
-            const pomResponse = await fetch(
+            const pomResponse = await fetchWithAbortTimeout(
               `https://api.github.com/repos/${owner}/${repo}/contents/pom.xml`,
               {
                 headers: { Authorization: `token ${process.env.GITHUB_TOKEN}` },
@@ -517,28 +651,39 @@ Return this exact JSON structure:
                 auditorPomPaths.push("pom.xml");
                 auditorManifestSnippets.push({
                   path: "pom.xml",
-                  preview: pomContent.slice(0, 4000),
+                  preview: pomContent.slice(0, 3200),
                 });
+                loadedPom = true;
               }
             }
           } catch {
-            /* fallback to tree paths below */
+            /* fallback to tree path below */
           }
 
-          // Additional pom.xml files (multi-module) from the tree.
-          for (const pomPath of pomXmlBlobPaths.slice(0, 6)) {
-            if (pomPath === "pom.xml") continue;
+          if (
+            !loadedPom &&
+            pomXmlBlobPaths[0] &&
+            auditorPomPaths.length === 0
+          ) {
+            const pomPath = pomXmlBlobPaths[0];
             try {
-              const { data: blob } = await octokit.repos.getContent({
-                owner,
-                repo,
-                path: pomPath,
-              });
-              if (!("content" in blob)) continue;
-              const pomContent = Buffer.from(blob.content, "base64").toString("utf-8");
-              parsePomDependencies(pomContent, pomPath);
-              auditorPomPaths.push(pomPath);
-              auditorManifestSnippets.push({ path: pomPath, preview: pomContent.slice(0, 4000) });
+              const { data: blob } = await octokitWithTimeout((signal) =>
+                octokit.repos.getContent({
+                  owner,
+                  repo,
+                  path: pomPath,
+                  request: { signal },
+                })
+              );
+              if ("content" in blob) {
+                const pomContent = Buffer.from(blob.content, "base64").toString("utf-8");
+                parsePomDependencies(pomContent, pomPath);
+                auditorPomPaths.push(pomPath);
+                auditorManifestSnippets.push({
+                  path: pomPath,
+                  preview: pomContent.slice(0, 3200),
+                });
+              }
             } catch {
               /* skip unreadable pom.xml */
             }
@@ -548,13 +693,16 @@ Return this exact JSON structure:
         if (auditorPackageJsonPaths.length === 0 && gradleBlobPaths.length > 0) {
           const gradlePattern =
             /(?:implementation|api|compileOnly|runtimeOnly|testImplementation)\s*\(?\s*["']([^:"'\s]+):([^:"'\s]+):([^"'\s)]+)["']\s*\)?/g;
-          for (const gradlePath of gradleBlobPaths.slice(0, 6)) {
+          for (const gradlePath of gradleBlobPaths.slice(0, 1)) {
             try {
-              const { data: blob } = await octokit.repos.getContent({
-                owner,
-                repo,
-                path: gradlePath,
-              });
+              const { data: blob } = await octokitWithTimeout((signal) =>
+                octokit.repos.getContent({
+                  owner,
+                  repo,
+                  path: gradlePath,
+                  request: { signal },
+                })
+              );
               if (!("content" in blob)) continue;
               const gradleContent = Buffer.from(blob.content, "base64").toString("utf-8");
               const matches = gradleContent.matchAll(gradlePattern);
@@ -573,11 +721,34 @@ Return this exact JSON structure:
               auditorGradlePaths.push(gradlePath);
               auditorManifestSnippets.push({
                 path: gradlePath,
-                preview: gradleContent.slice(0, 4000),
+                preview: gradleContent.slice(0, 3200),
               });
             } catch {
               /* skip unreadable build.gradle */
             }
+          }
+        }
+
+        const riskFileContents: { path: string; content: string }[] = [];
+        for (const file of riskSourceFiles) {
+          try {
+            const { data: blob } = await octokitWithTimeout((signal) =>
+              octokit.repos.getContent({
+                owner,
+                repo,
+                path: file.path,
+                request: { signal },
+              })
+            );
+            if ("content" in blob) {
+              const content = Buffer.from(blob.content, "base64").toString("utf-8");
+              riskFileContents.push({
+                path: file.path,
+                content: content.slice(0, 420),
+              });
+            }
+          } catch {
+            /* skip unreadable file */
           }
         }
 
@@ -596,16 +767,15 @@ Return this exact JSON structure:
               : "No package.json in tree — inferring dependencies from codebase files...",
         });
 
-        const riskModel = genAI.getGenerativeModel({
-          model: "gemini-2.5-flash",
-        });
-        const auditorModel = genAI.getGenerativeModel({
-          model: "gemini-2.5-flash",
-        });
-
         const riskPrompt = `You are a risk detector. Analyze this codebase for issues. Return ONLY valid JSON.
 Project type: ${projectType}
-Files analyzed: ${JSON.stringify(fileContents.map(f => ({ path: f.path, preview: f.content.slice(0, 200) })))}
+Top ${RISK_TOP_FILES_BY_SIZE} files by size (path + short preview only):
+${JSON.stringify(
+          riskFileContents.map((f) => ({
+            path: f.path,
+            preview: f.content.slice(0, 200),
+          }))
+        )}
 
 If project type is Java (Maven or Gradle), prioritize checking for:
 - SQL injection in JDBC calls
@@ -646,32 +816,22 @@ Return this exact JSON shape (field names camelCase):
         const auditorPrompt = `You are a dependency auditor for a GitHub repository.
 Project type: ${projectType}
 
-PRIMARY SOURCE (use this when provided): Declared dependencies fetched from real manifest files in the repo Git tree:
-- Node.js: package.json
-- Java/Maven: pom.xml
-- Java/Gradle: build.gradle or build.gradle.kts
+Manifest scope: only the primary manifest file was loaded (Node: root/first package.json; Java: one pom.xml or one Gradle file).
 
-Package.json blob paths fetched from repo (excluding node_modules):
-${JSON.stringify(auditorPackageJsonPaths.length ? auditorPackageJsonPaths : ["(none found)"])}
+Manifest paths actually loaded (≤1 each):
+- package.json: ${JSON.stringify(auditorPackageJsonPaths.slice(0, 1))}
+- pom.xml: ${JSON.stringify(auditorPomPaths.slice(0, 1))}
+- build.gradle: ${JSON.stringify(auditorGradlePaths.slice(0, 1))}
 
-pom.xml paths fetched from repo:
-${JSON.stringify(auditorPomPaths.length ? auditorPomPaths : ["(none found)"])}
+Declared dependency entries (deduplicated; max 80 shown). Fields: name, range, kind, fromPath:
+${JSON.stringify(auditorDependencyEntries.slice(0, 80))}
 
-build.gradle paths fetched from repo:
-${JSON.stringify(auditorGradlePaths.length ? auditorGradlePaths : ["(none found)"])}
-
-Declared dependency entries (deduplicated by package name — first occurrence wins when multiple manifests exist). Fields: name, declared version/range, dependency kind, originating manifest path:
-${JSON.stringify(auditorDependencyEntries.slice(0, 200))}
-
-Truncated raw manifest excerpts for context:
+Truncated manifest excerpt(s) only:
 ${JSON.stringify(auditorManifestSnippets)}
-
-Code file paths sampled from the codebase (secondary context):
-${JSON.stringify(fileContents.map((f) => f.path))}
 
 Instructions:
 1. Prefer analyzing the real manifest dependencies above. Reference package names and version ranges exactly as declared.
-2. If no manifest was found, infer dependencies cautiously from file paths only and note that in the summary.
+2. If no manifest was found, infer dependencies cautiously and note that in the summary.
 3. Assess whether entries look outdated, loosely specified, or plausibly vulnerable from general ecosystem knowledge — return conservative severity unless clearly critical.
 
 Return ONLY valid JSON:
@@ -682,16 +842,16 @@ Return ONLY valid JSON:
   "summary": "brief summary referencing which manifest type was used"
 }`;
 
-        const [riskResult, auditResult] = await Promise.all([
-          riskModel.generateContent(riskPrompt),
-          auditorModel.generateContent(auditorPrompt),
+        const [riskText, auditText] = await Promise.all([
+          geminiGenerateContent(riskPrompt),
+          geminiGenerateContent(auditorPrompt),
         ]);
 
         let riskData: RiskAgentPayload = { risks: [], summary: "Analysis complete" };
         let auditData = { dependencies: [], summary: "Audit complete" };
 
         try {
-          const riskMatch = riskResult.response.text().match(/\{[\s\S]*\}/);
+          const riskMatch = riskText.match(/\{[\s\S]*\}/);
           if (riskMatch) {
             const raw = JSON.parse(riskMatch[0]) as Record<string, unknown>;
             riskData = {
@@ -702,7 +862,7 @@ Return ONLY valid JSON:
         } catch {}
 
         try {
-          const auditMatch = auditResult.response.text().match(/\{[\s\S]*\}/);
+          const auditMatch = auditText.match(/\{[\s\S]*\}/);
           if (auditMatch) auditData = JSON.parse(auditMatch[0]);
         } catch {}
 
@@ -712,25 +872,34 @@ Return ONLY valid JSON:
         // ── AGENT 4: SCORER ──────────────────────────────
         send({ agent: "scorer", status: "running", msg: "Calculating health score..." });
 
-        const scorerModel = genAI.getGenerativeModel({
-          model: "gemini-2.5-flash",
-        });
-
         const scorerNodes = Array.isArray(mapperData.nodes) ? mapperData.nodes : [];
         const scorerRisks = Array.isArray(riskData.risks) ? riskData.risks : [];
-        const scorerDeps = Array.isArray(auditData.dependencies) ? auditData.dependencies : [];
-        const filesMappedCount = scorerNodes.length || files.length;
+        const scorerDeps = Array.isArray((auditData as { dependencies?: unknown }).dependencies)
+          ? ((auditData as { dependencies: unknown[] }).dependencies)
+          : [];
+        const filesMappedCount = scorerNodes.length || mappedFilePool.length;
+        const sev = countRiskSeverities(scorerRisks);
+        const depStats = countDepStatuses(scorerDeps);
 
-        const scorerPrompt = `Analyze this codebase health data and return ONLY a JSON object. No markdown, no explanation.
-Just raw JSON.
+        const mapperSummary =
+          typeof mapperData.summary === "string" ? mapperData.summary : "";
 
-Data:
-- Files mapped: ${filesMappedCount}
-- Risks found: ${scorerRisks.length}
-- Risk details: ${JSON.stringify(scorerRisks.slice(0, 50))}
-- Dependencies: ${scorerDeps.length}
+        const scorerPrompt = `Use SCORING RULES from system instruction — only summarized inputs below (no raw source files).
 
-Each numeric field must be an integer from 0 through 100. recommendations must be exactly 3 short strings. Output raw JSON only — no angle brackets in the final answer.
+Mapper summary:
+${mapperSummary}
+Nodes count (from mapper JSON): ~${Array.isArray(mapperData.nodes) ? mapperData.nodes.length : 0}; edges: ~${Array.isArray(mapperData.edges) ? mapperData.edges.length : 0}
+
+Risk agent summary:
+${riskData.summary}
+Risk count: ${scorerRisks.length}. Severity roll-up: ${JSON.stringify(sev)}
+
+Auditor summary:
+${typeof auditData.summary === "string" ? auditData.summary : ""}
+Dependency count: ${scorerDeps.length}. Status roll-up: ${JSON.stringify(depStats)}
+Known CVE / vulnerable-style signals: vulnerable=${depStats.vulnerable}, outdated=${depStats.outdated}
+
+Each numeric field must be an integer from 0 through 100. recommendations must be exactly 3 short strings. Output raw JSON only — no markdown, no prose, no angle brackets in the final answer.
 
 Return exactly this JSON shape:
 {
@@ -742,8 +911,9 @@ Return exactly this JSON shape:
   "recommendations": ["rec1", "rec2", "rec3"]
 }`;
 
-        const scorerResult = await scorerModel.generateContent(scorerPrompt);
-        const scorerRawText = scorerResult.response.text();
+        const scorerRawText = await geminiGenerateContent(scorerPrompt, {
+          systemInstruction: SCORER_SYSTEM_INSTRUCTION,
+        });
 
         console.log("[scorer] raw model response:\n", scorerRawText);
 
@@ -779,54 +949,84 @@ Return exactly this JSON shape:
             // Wait to reduce rate-limit risk before each attempt.
             await new Promise((resolve) => setTimeout(resolve, 2000));
 
-            const geminiResponse = await fetch(
-              `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
-              {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  contents: [
-                    {
-                      parts: [
-                        {
-                          text: `Security analysis results:
+            const insightsPrompt = `Security analysis results:
 Health: ${healthScore}/100
 Issues: ${issuesFound}
 Top risks: ${riskAnalysis
-  ?.slice(0, 3)
-  .map((r) => `${r.file}: ${r.issue}`)
-  .join(", ")}
+              ?.slice(0, 3)
+              .map((r) => `${r.file}: ${r.issue}`)
+              .join(", ")}
 Vulnerable deps: ${dependencies
-  ?.filter((d: any) => String(d?.status ?? "").toUpperCase() === "VULNERABLE")
-  .map((d: any) => d?.name || "unknown")
-  .join(", ")}
+              ?.filter(
+                (d) =>
+                  String((d as { status?: unknown })?.status ?? "").toUpperCase() ===
+                  "VULNERABLE"
+              )
+              .map((d) => String((d as { name?: unknown })?.name ?? "unknown"))
+              .join(", ")}
 
 Return ONLY this JSON, no other text:
-{"summary":"2 sentence summary","criticalActions":[{"action":"action 1","reason":"why","effort":"High"},{"action":"action 2","reason":"why","effort":"Medium"}],"recommendations":["rec 1","rec 2","rec 3","rec 4","rec 5"],"securityGrade":"C","estimatedFixTime":"3-5 hours"}`,
-                        },
-                      ],
+{"summary":"2 sentence summary","criticalActions":[{"action":"action 1","reason":"why","effort":"High"},{"action":"action 2","reason":"why","effort":"Medium"}],"recommendations":["rec 1","rec 2","rec 3","rec 4","rec 5"],"securityGrade":"C","estimatedFixTime":"3-5 hours"}`;
+
+            const geminiApi = await geminiREST(insightsPrompt);
+
+            if (geminiApi.ok) {
+              try {
+                const rawText = geminiApi.text || "";
+                console.log("Raw Gemini text:", rawText.substring(0, 200));
+
+                // Extract JSON between first { and last }
+                const start = rawText.indexOf("{");
+                const end = rawText.lastIndexOf("}");
+
+                if (start !== -1 && end !== -1) {
+                  let jsonStr = rawText.substring(start, end + 1);
+
+                  // Fix common JSON issues
+                  jsonStr = jsonStr
+                    .replace(/[\x00-\x1F\x7F]/g, " ")
+                    .replace(/\n/g, " ")
+                    .replace(/\r/g, " ")
+                    .replace(/\t/g, " ")
+                    .replace(/\\/g, "\\\\")
+                    .replace(/"{/g, '"{')
+                    .replace(/}"/g, '}"');
+
+                  aiInsights = JSON.parse(jsonStr);
+                  console.log("Gemini parsed successfully");
+                  break;
+                }
+              } catch (e) {
+                const msg = e instanceof Error ? e.message : String(e);
+                console.error("Parse failed:", msg);
+                aiInsights = {
+                  summary:
+                    "Analysis complete. Review findings below.",
+                  criticalActions: [
+                    {
+                      action: "Fix critical vulnerabilities immediately",
+                      reason: "High security risk",
+                      effort: "High",
+                    },
+                    {
+                      action: "Update outdated dependencies",
+                      reason: "Known CVEs present",
+                      effort: "Medium",
                     },
                   ],
-                  generationConfig: { maxOutputTokens: 400, temperature: 0.2 },
-                }),
+                  recommendations: [
+                    "Review and fix all critical findings",
+                    "Update all outdated packages",
+                    "Implement input validation",
+                    "Add security headers",
+                    "Review authentication logic",
+                  ],
+                  securityGrade: "C",
+                  estimatedFixTime: "2-4 hours",
+                };
               }
-            );
-
-            const geminiData = await geminiResponse.json();
-            console.log("Gemini status:", geminiResponse.status);
-
-            if (geminiResponse.ok) {
-              const rawText = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
-              const cleaned = String(rawText).replace(/```json|```/g, "").trim();
-              const parsedInsights = normalizeGeminiInsights(JSON.parse(cleaned));
-              if (parsedInsights) {
-                aiInsights = parsedInsights;
-                console.log("Gemini insights success:", aiInsights);
-                break;
-              }
-              console.log("Gemini returned invalid insights shape; using fallback.");
             } else {
-              console.log("Gemini failed, using fallback. Status:", geminiResponse.status);
+              console.log("Gemini failed, using fallback. Status:", geminiApi.status);
             }
           } catch (e) {
             const msg = e instanceof Error ? e.message : String(e);
