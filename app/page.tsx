@@ -1,7 +1,7 @@
 "use client"
 
 import * as d3 from "d3"
-import { useState, useEffect, useRef, useCallback } from "react"
+import { useState, useEffect, useRef, useCallback, type Dispatch, type SetStateAction } from "react"
 import Link from "next/link"
 import { StackSenseLogo } from "@/components/stacksense-logo"
 
@@ -432,8 +432,44 @@ function DependencyGraph() {
 // ============================================================================
 // HERO SECTION
 // ============================================================================
-function Hero() {
-  const [showDemo, setShowDemo] = useState(false)
+function Hero({
+  showDemo,
+  setShowDemo,
+}: {
+  showDemo: boolean
+  setShowDemo: Dispatch<SetStateAction<boolean>>
+}) {
+  const [expandedFinding, setExpandedFinding] = useState<number | null>(null)
+
+  const findings = [
+    {
+      id: "CVE-2024-21538",
+      desc: "cross-spawn vulnerability in node_modules",
+      severity: "CRITICAL",
+      color: "#ff5f57",
+      what: "CVE-2024-21538 is a known vulnerability in the cross-spawn package - a utility used to spawn child processes. It allows attackers to execute arbitrary commands.",
+      why: "If exploited, an attacker can run malicious commands on your server. This is a Remote Code Execution risk that can completely compromise your application.",
+      fix: 'npm install cross-spawn@latest\n// or update in package.json:\n"cross-spawn": "^7.0.6"',
+    },
+    {
+      id: "Exposed API Key",
+      desc: "Hardcoded secret found in config/database.js line 23",
+      severity: "HIGH",
+      color: "#ffbd2e",
+      what: "A hardcoded API key or password was found directly in your source code. Anyone with access to your repository can see and use this credential.",
+      why: "Exposed secrets are one of the most common causes of data breaches. Attackers scan GitHub for hardcoded credentials automatically within minutes of a push.",
+      fix: '// Remove hardcoded secret:\n// const API_KEY = "sk-abc123..." X\n\n// Use environment variables instead:\nconst API_KEY = process.env.API_KEY\n\n// Add to .env file (never commit this):\nAPI_KEY=sk-abc123...',
+    },
+    {
+      id: "Outdated lodash@4.17.15",
+      desc: "Critical security patches available in v4.17.21",
+      severity: "HIGH",
+      color: "#ffbd2e",
+      what: "lodash version 4.17.15 has known security vulnerabilities including prototype pollution attacks that were fixed in version 4.17.21.",
+      why: "Prototype pollution can allow attackers to modify JavaScript object behavior globally, potentially leading to denial of service or remote code execution.",
+      fix: 'npm install lodash@latest\n// or update package.json:\n"lodash": "^4.17.21"',
+    },
+  ] as const
 
   return (
     <section className="relative flex min-h-screen items-center justify-center pt-24">
@@ -492,13 +528,6 @@ function Hero() {
             >
               Get Started Free &rarr;
             </Link>
-            <button
-              type="button"
-              onClick={() => setShowDemo(true)}
-              className="rounded-md border border-[#325F57] px-8 py-4 font-sans text-[15px] font-semibold text-[#7ab8a4] transition-colors hover:bg-[rgba(50,95,87,0.1)]"
-            >
-              Watch Demo
-            </button>
           </div>
 
           {/* Micro text */}
@@ -511,7 +540,6 @@ function Hero() {
       {/* Scroll indicator */}
       <div className="absolute bottom-8 left-1/2 flex -translate-x-1/2 flex-col items-center gap-2">
         <div className="h-8 w-[1px] animate-pulse bg-gradient-to-b from-transparent via-[#325F57] to-transparent" />
-        <span className="font-mono text-[10px] text-[#325F57]">scroll</span>
       </div>
 
       {showDemo && (
@@ -523,12 +551,13 @@ function Hero() {
             right: 0,
             bottom: 0,
             background: "rgba(4,21,26,0.92)",
-            zIndex: 1000,
+            zIndex: 40,
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
             padding: "2rem",
             backdropFilter: "blur(8px)",
+            animation: "demoBackdropIn 220ms ease-out",
           }}
           onClick={() => setShowDemo(false)}
         >
@@ -541,6 +570,7 @@ function Hero() {
               borderRadius: "12px",
               border: "1px solid #163E3C",
               boxShadow: "0 0 80px rgba(50,95,87,0.2)",
+              animation: "demoModalIn 220ms ease-out",
             }}
             onClick={(e) => e.stopPropagation()}
           >
@@ -567,7 +597,7 @@ function Hero() {
                     padding: "3px 12px",
                     fontFamily: "IBM Plex Mono, monospace",
                     fontSize: "11px",
-                    color: "#6F9487",
+                    color: "#b8d4c8",
                   }}
                 >
                   stacksense.app/report/acme-api
@@ -576,7 +606,17 @@ function Hero() {
               <button
                 type="button"
                 onClick={() => setShowDemo(false)}
-                style={{ background: "none", border: "none", color: "#6F9487", cursor: "pointer", fontSize: "18px", lineHeight: 1 }}
+                aria-label="Close demo modal"
+                style={{
+                  background: "#04151A",
+                  border: "1px solid #325F57",
+                  borderRadius: "6px",
+                  color: "#ffffff",
+                  cursor: "pointer",
+                  fontSize: "18px",
+                  lineHeight: 1,
+                  padding: "4px 8px",
+                }}
               >
                 ✕
               </button>
@@ -593,11 +633,11 @@ function Hero() {
                   { label: "Files Scanned", value: "1,247", tag: "Completed in 54s", tagColor: "#325F57" },
                 ].map((card, i) => (
                   <div key={i} style={{ background: "#092828", border: "1px solid #163E3C", borderRadius: "8px", padding: "1rem" }}>
-                    <div style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: "10px", color: "#6F9487", marginBottom: "8px" }}>{card.label}</div>
+                    <div style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: "10px", color: "#b8d4c8", marginBottom: "8px" }}>{card.label}</div>
                     <div
                       style={{
                         fontFamily: "DM Serif Display, serif",
-                        fontSize: "28px",
+                        fontSize: "32px",
                         color: i === 1 ? "#ff5f57" : "#ffffff",
                         marginBottom: "4px",
                       }}
@@ -612,20 +652,20 @@ function Hero() {
               {/* Agent results */}
               <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: "8px", marginBottom: "1rem" }}>
                 {[
-                  { name: "Mapper", finding: "1,247 files · 89 modules · 12 circular deps" },
-                  { name: "Risk Detector", finding: "3 critical · 8 high · 14 medium" },
-                  { name: "Auditor", finding: "23 outdated · 2 CVE matches found" },
-                  { name: "Scorer", finding: "Health: 72/100 · Tech debt: High" },
+                  { name: "Mapper", finding: "Repository map generated successfully." },
+                  { name: "Risk Detector", finding: "Security risk scan completed." },
+                  { name: "Auditor", finding: "Dependency and CVE audit completed." },
+                  { name: "Scorer", finding: "Health scoring analysis completed." },
                 ].map((agent, i) => (
                   <div key={i} style={{ background: "#092828", border: "1px solid #163E3C", borderRadius: "8px", padding: "12px" }}>
                     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
-                      <span style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: "11px", color: "#325F57" }}>{agent.name}</span>
+                      <span style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: "11px", color: "#ffffff" }}>{agent.name}</span>
                       <span
                         style={{
                           fontFamily: "IBM Plex Mono, monospace",
                           fontSize: "9px",
-                          color: "#325F57",
-                          background: "rgba(50,95,87,0.2)",
+                          color: "#7ab8a4",
+                          background: "rgba(50,95,87,0.25)",
                           borderRadius: "999px",
                           padding: "2px 6px",
                         }}
@@ -644,7 +684,7 @@ function Hero() {
                   style={{
                     fontFamily: "IBM Plex Mono, monospace",
                     fontSize: "11px",
-                    color: "#6F9487",
+                    color: "#ffffff",
                     borderBottom: "1px solid #163E3C",
                     paddingBottom: "8px",
                     marginBottom: "12px",
@@ -652,41 +692,117 @@ function Hero() {
                 >
                   Critical Findings
                 </div>
-                {[
-                  { id: "CVE-2024-21538", desc: "cross-spawn vulnerability in node_modules", severity: "CRITICAL", color: "#ff5f57" },
-                  { id: "Exposed API Key", desc: "Hardcoded secret found in config/database.js line 23", severity: "HIGH", color: "#ffbd2e" },
-                  { id: "Outdated lodash@4.17.15", desc: "Critical security patches available in v4.17.21", severity: "HIGH", color: "#ffbd2e" },
-                ].map((issue, i) => (
+                {findings.map((finding, i) => (
                   <div
                     key={i}
-                    style={{
-                      display: "flex",
-                      justifyContent: "space-between",
-                      alignItems: "flex-start",
-                      padding: "8px 0",
-                      borderBottom: i < 2 ? "1px solid rgba(22,62,60,0.5)" : "none",
-                    }}
+                    onClick={() => setExpandedFinding(expandedFinding === i ? null : i)}
                   >
-                    <div style={{ display: "flex", alignItems: "flex-start", gap: "8px" }}>
-                      <div style={{ width: 6, height: 6, borderRadius: "50%", background: issue.color, marginTop: "4px", flexShrink: 0 }} />
-                      <div>
-                        <div style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: "11px", color: issue.color }}>{issue.id}</div>
-                        <div style={{ fontFamily: "Outfit, sans-serif", fontSize: "12px", color: "#b8d4c8", marginTop: "2px" }}>{issue.desc}</div>
-                      </div>
-                    </div>
-                    <span
+                    <div
                       style={{
-                        fontFamily: "IBM Plex Mono, monospace",
-                        fontSize: "9px",
-                        color: issue.color,
-                        background: `rgba(${issue.color === "#ff5f57" ? "255,95,87" : "255,189,46"},0.1)`,
-                        borderRadius: "4px",
-                        padding: "2px 6px",
-                        flexShrink: 0,
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "flex-start",
+                        padding: "8px 0",
+                        borderBottom: i < findings.length - 1 && expandedFinding !== i ? "1px solid rgba(22,62,60,0.5)" : "none",
+                        cursor: "pointer",
                       }}
                     >
-                      {issue.severity}
-                    </span>
+                      <div style={{ display: "flex", alignItems: "flex-start", gap: "8px" }}>
+                        <div style={{ width: 6, height: 6, borderRadius: "50%", background: finding.color, marginTop: "4px", flexShrink: 0 }} />
+                        <div>
+                          <div style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: "11px", color: finding.color }}>{finding.id}</div>
+                          <div style={{ fontFamily: "Outfit, sans-serif", fontSize: "12px", color: "#b8d4c8", marginTop: "2px" }}>{finding.desc}</div>
+                        </div>
+                      </div>
+                      <div style={{ display: "flex", alignItems: "center", gap: "8px", flexShrink: 0 }}>
+                        <span
+                          style={{
+                            fontFamily: "IBM Plex Mono, monospace",
+                            fontSize: "9px",
+                            color: finding.color,
+                            background: `rgba(${finding.color === "#ff5f57" ? "255,95,87" : "255,189,46"},0.1)`,
+                            borderRadius: "4px",
+                            padding: "2px 6px",
+                          }}
+                        >
+                          {finding.severity}
+                        </span>
+                        <span style={{ color: "#b8d4c8", fontSize: "10px", lineHeight: 1 }}>
+                          {expandedFinding === i ? "▲" : "▼"}
+                        </span>
+                      </div>
+                    </div>
+                    {expandedFinding === i && (
+                      <div
+                        style={{
+                          background: "#04151A",
+                          border: "1px solid #163E3C",
+                          borderRadius: "0 0 8px 8px",
+                          padding: "1rem 1.5rem",
+                          marginTop: "-4px",
+                          marginBottom: i < findings.length - 1 ? "8px" : "0",
+                        }}
+                      >
+                        <div style={{ marginBottom: "12px" }}>
+                          <div
+                            style={{
+                              fontFamily: "IBM Plex Mono, monospace",
+                              fontSize: "10px",
+                              color: "#325F57",
+                              letterSpacing: "0.1em",
+                              marginBottom: "6px",
+                            }}
+                          >
+                            ▸ WHAT IS THIS?
+                          </div>
+                          <div style={{ fontFamily: "Outfit, sans-serif", fontSize: "13px", color: "#b8d4c8", lineHeight: 1.6 }}>{finding.what}</div>
+                        </div>
+
+                        <div style={{ marginBottom: "12px" }}>
+                          <div
+                            style={{
+                              fontFamily: "IBM Plex Mono, monospace",
+                              fontSize: "10px",
+                              color: "#ff5f57",
+                              letterSpacing: "0.1em",
+                              marginBottom: "6px",
+                            }}
+                          >
+                            ▸ WHY IT IS DANGEROUS
+                          </div>
+                          <div style={{ fontFamily: "Outfit, sans-serif", fontSize: "13px", color: "#b8d4c8", lineHeight: 1.6 }}>{finding.why}</div>
+                        </div>
+
+                        <div>
+                          <div
+                            style={{
+                              fontFamily: "IBM Plex Mono, monospace",
+                              fontSize: "10px",
+                              color: "#28ca41",
+                              letterSpacing: "0.1em",
+                              marginBottom: "6px",
+                            }}
+                          >
+                            ▸ HOW TO FIX IT
+                          </div>
+                          <div
+                            style={{
+                              background: "#092828",
+                              border: "1px solid #163E3C",
+                              borderRadius: "6px",
+                              padding: "10px 14px",
+                              fontFamily: "IBM Plex Mono, monospace",
+                              fontSize: "12px",
+                              color: "#28ca41",
+                              lineHeight: 1.6,
+                              whiteSpace: "pre-wrap",
+                            }}
+                          >
+                            {finding.fix}
+                          </div>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 ))}
               </div>
@@ -705,7 +821,7 @@ function Hero() {
                   style={{
                     fontFamily: "IBM Plex Mono, monospace",
                     fontSize: "11px",
-                    color: "#6F9487",
+                    color: "#ffffff",
                     borderBottom: "1px solid #163E3C",
                     paddingBottom: "8px",
                     marginBottom: "12px",
@@ -714,7 +830,7 @@ function Hero() {
                   }}
                 >
                   <span>Dependency Graph</span>
-                  <span style={{ color: "#325F57" }}>89 modules · 12 circular deps detected</span>
+                  <span style={{ color: "#b8d4c8" }}>89 modules · 12 circular deps detected</span>
                 </div>
                 <DependencyGraph />
               </div>
@@ -722,6 +838,26 @@ function Hero() {
           </div>
         </div>
       )}
+      <style jsx global>{`
+        @keyframes demoModalIn {
+          from {
+            opacity: 0;
+            transform: scale(0.95);
+          }
+          to {
+            opacity: 1;
+            transform: scale(1);
+          }
+        }
+        @keyframes demoBackdropIn {
+          from {
+            opacity: 0;
+          }
+          to {
+            opacity: 1;
+          }
+        }
+      `}</style>
     </section>
   )
 }
@@ -1179,7 +1315,11 @@ function StatsBar() {
 // ============================================================================
 // FINAL CTA SECTION
 // ============================================================================
-function FinalCTA() {
+function FinalCTA({
+  setShowDemo,
+}: {
+  setShowDemo: Dispatch<SetStateAction<boolean>>
+}) {
   return (
     <section
       id="cta"
@@ -1215,12 +1355,13 @@ function FinalCTA() {
           >
             Get Started Free &rarr;
           </Link>
-          <Link
-            href="#"
+          <button
+            type="button"
+            onClick={() => setShowDemo(true)}
             className="rounded-md border border-[#325F57] px-10 py-5 font-sans text-[16px] font-semibold text-[#7ab8a4] transition-colors hover:bg-[rgba(50,95,87,0.1)]"
           >
-            View Sample Report
-          </Link>
+            Watch Demo
+          </button>
         </div>
 
         {/* Micro */}
@@ -1279,19 +1420,21 @@ function Footer() {
 // MAIN PAGE
 // ============================================================================
 export default function Home() {
+  const [showDemo, setShowDemo] = useState(false)
+
   return (
     <main className="relative min-h-screen bg-[#04151A]">
       <CanvasBackground />
       <Navbar />
       <StatusBar />
-      <Hero />
+      <Hero showDemo={showDemo} setShowDemo={setShowDemo} />
       <SocialProofBar />
       <ProblemSection />
       <AgentsSection />
       <HowItWorksSection />
       <FeaturesSection />
       <StatsBar />
-      <FinalCTA />
+      <FinalCTA setShowDemo={setShowDemo} />
       <Footer />
     </main>
   )

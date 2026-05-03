@@ -265,8 +265,12 @@ export default function About() {
             lineHeight: 1.8,
           }}
         >
-          A friend&apos;s startup lost 3 years of user data overnight. One outdated dependency. One exposed API key. Nobody
-          caught it — because they never had the tools to look.
+          Every hackathon, every side project — you&apos;re so deep in building that security is the last thing on your mind.
+          As a young developer still learning, you skip the audit. You hardcode the key just this once. You forget to check
+          your dependencies. Not because you don&apos;t care — but because nobody told you to look, and the tools that exist
+          are built for enterprise teams, not for developers like us who are still figuring things out. We built StackSense
+          because we kept making these mistakes ourselves. Before you deploy, before you ship, before it&apos;s too late —
+          now you have somewhere to check.
         </p>
         <p
           style={{
@@ -277,7 +281,7 @@ export default function About() {
             marginBottom: "5rem",
           }}
         >
-          StackSense exists so that never happens to you.
+          Built by a young developer, for every developer still learning.
         </p>
 
         {/* 3 Problems */}

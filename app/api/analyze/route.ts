@@ -89,6 +89,77 @@ function parseJsonLoose(text: string): unknown | null {
   return null;
 }
 
+function parseRecommendationsArray(text: string): string[] {
+  try {
+    const cleaned = text.replace(/```json|```/g, "").trim();
+    const parsed = JSON.parse(cleaned);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((item): item is string => typeof item === "string")
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .slice(0, 3);
+  } catch {
+    return [];
+  }
+}
+
+type GeminiInsightsShape = {
+  summary: string;
+  criticalActions: { action: string; reason: string; effort: "Low" | "Medium" | "High" }[];
+  recommendations: string[];
+  securityGrade: "A" | "B" | "C" | "D" | "F";
+  estimatedFixTime: string;
+};
+
+function normalizeGeminiInsights(raw: unknown): GeminiInsightsShape | null {
+  if (!raw || typeof raw !== "object") return null;
+  const o = raw as Record<string, unknown>;
+  const summary = typeof o.summary === "string" ? o.summary.trim() : "";
+  const estimatedFixTime =
+    typeof o.estimatedFixTime === "string" ? o.estimatedFixTime.trim() : "";
+  const securityGradeRaw =
+    typeof o.securityGrade === "string" ? o.securityGrade.trim().toUpperCase() : "";
+  const securityGrade = ["A", "B", "C", "D", "F"].includes(securityGradeRaw)
+    ? (securityGradeRaw as GeminiInsightsShape["securityGrade"])
+    : "C";
+
+  const recommendations = Array.isArray(o.recommendations)
+    ? o.recommendations
+        .filter((item): item is string => typeof item === "string")
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .slice(0, 5)
+    : [];
+
+  const criticalActions = Array.isArray(o.criticalActions)
+    ? o.criticalActions
+        .map((item) => {
+          if (!item || typeof item !== "object") return null;
+          const a = item as Record<string, unknown>;
+          const action = typeof a.action === "string" ? a.action.trim() : "";
+          const reason = typeof a.reason === "string" ? a.reason.trim() : "";
+          const effortRaw = typeof a.effort === "string" ? a.effort.trim() : "";
+          const effort = ["Low", "Medium", "High"].includes(effortRaw)
+            ? (effortRaw as "Low" | "Medium" | "High")
+            : "Medium";
+          if (!action || !reason) return null;
+          return { action, reason, effort };
+        })
+        .filter((x): x is { action: string; reason: string; effort: "Low" | "Medium" | "High" } => x !== null)
+        .slice(0, 5)
+    : [];
+
+  if (!summary) return null;
+  return {
+    summary,
+    criticalActions,
+    recommendations,
+    securityGrade,
+    estimatedFixTime: estimatedFixTime || "Unknown",
+  };
+}
+
 type ScorerShape = {
   score: number;
   coupling: number;
@@ -259,6 +330,52 @@ export async function POST(req: Request) {
           .filter((f) => f.type === "blob" && isAllowedSourceBlobPath(f.path))
           .slice(0, 30);
 
+        const packageJsonBlobPaths = tree.tree
+          .filter(
+            (f) =>
+              f.type === "blob" &&
+              f.path &&
+              !f.path.includes("node_modules") &&
+              (f.path === "package.json" || f.path.endsWith("/package.json"))
+          )
+          .map((f) => f.path!)
+          .sort((a, b) => {
+            if (a === "package.json") return -1;
+            if (b === "package.json") return 1;
+            return a.split("/").length - b.split("/").length;
+          });
+        const pomXmlBlobPaths = tree.tree
+          .filter(
+            (f) =>
+              f.type === "blob" &&
+              f.path &&
+              !f.path.includes("node_modules") &&
+              (f.path === "pom.xml" || f.path.endsWith("/pom.xml"))
+          )
+          .map((f) => f.path!)
+          .sort((a, b) => a.split("/").length - b.split("/").length);
+        const gradleBlobPaths = tree.tree
+          .filter(
+            (f) =>
+              f.type === "blob" &&
+              f.path &&
+              !f.path.includes("node_modules") &&
+              (f.path === "build.gradle" ||
+                f.path === "build.gradle.kts" ||
+                f.path.endsWith("/build.gradle") ||
+                f.path.endsWith("/build.gradle.kts"))
+          )
+          .map((f) => f.path!)
+          .sort((a, b) => a.split("/").length - b.split("/").length);
+        const projectType =
+          packageJsonBlobPaths.length > 0
+            ? "nodejs"
+            : pomXmlBlobPaths.length > 0
+              ? "java-maven"
+              : gradleBlobPaths.length > 0
+                ? "java-gradle"
+                : "unknown";
+
         const fileContents: { path: string; content: string }[] = [];
         
         for (const file of files.slice(0, 15)) {
@@ -276,9 +393,10 @@ export async function POST(req: Request) {
         }
 
         const mapperModel = genAI.getGenerativeModel({
-          model: "gemma-3-27b-it",
+          model: "gemini-2.5-flash",
         });
         const mapperPrompt = `You are a codebase mapper. Analyze these files and return ONLY valid JSON.
+Project type: ${projectType}
 Files: ${JSON.stringify(fileContents.map(f => f.path))}
 
 Return this exact JSON structure:
@@ -299,26 +417,12 @@ Return this exact JSON structure:
 
         send({ agent: "mapper", status: "done", data: mapperData, msg: `Mapped ${files.length} files successfully` });
 
-        // ── Fetch package.json for Auditor ─────────────────
-        const packageJsonBlobPaths = tree.tree
-          .filter(
-            (f) =>
-              f.type === "blob" &&
-              f.path &&
-              !f.path.includes("node_modules") &&
-              (f.path === "package.json" || f.path.endsWith("/package.json"))
-          )
-          .map((f) => f.path!)
-          .sort((a, b) => {
-            if (a === "package.json") return -1;
-            if (b === "package.json") return 1;
-            return a.split("/").length - b.split("/").length;
-          });
-
         type PkgDepEntry = { name: string; range: string; kind: string; fromPath: string };
         const auditorPackageJsonPaths: string[] = [];
+        const auditorPomPaths: string[] = [];
+        const auditorGradlePaths: string[] = [];
         const auditorDependencyEntries: PkgDepEntry[] = [];
-        const auditorPackageJsonSnippets: { path: string; preview: string }[] = [];
+        const auditorManifestSnippets: { path: string; preview: string }[] = [];
         const seenDepNames = new Set<string>();
 
         const recordDeps = (
@@ -352,13 +456,128 @@ Return this exact JSON structure:
             };
 
             auditorPackageJsonPaths.push(pkgPath);
-            auditorPackageJsonSnippets.push({ path: pkgPath, preview: raw.slice(0, 4000) });
+            auditorManifestSnippets.push({ path: pkgPath, preview: raw.slice(0, 4000) });
             recordDeps(pkg.dependencies, "dependencies", pkgPath);
             recordDeps(pkg.devDependencies, "devDependencies", pkgPath);
             recordDeps(pkg.peerDependencies, "peerDependencies", pkgPath);
             recordDeps(pkg.optionalDependencies, "optionalDependencies", pkgPath);
           } catch {
             /* invalid JSON or fetch error — skip */
+          }
+        }
+
+        if (auditorPackageJsonPaths.length === 0 && pomXmlBlobPaths.length > 0) {
+          const parsePomDependencies = (pomContent: string, fromPath: string) => {
+            const depBlocks = pomContent.match(/<dependency>[\s\S]*?<\/dependency>/g) || [];
+            for (const block of depBlocks) {
+              const artifact = block.match(/<artifactId>([^<]+)<\/artifactId>/)?.[1]?.trim();
+              const version = block.match(/<version>([^<]+)<\/version>/)?.[1]?.trim() || "unknown";
+              if (!artifact || seenDepNames.has(artifact)) continue;
+              seenDepNames.add(artifact);
+              auditorDependencyEntries.push({
+                name: artifact,
+                range: version,
+                kind: "maven",
+                fromPath,
+              });
+            }
+          };
+
+          // Root pom.xml via GitHub contents API fetch (as requested).
+          try {
+            const pomResponse = await fetch(
+              `https://api.github.com/repos/${owner}/${repo}/contents/pom.xml`,
+              {
+                headers: { Authorization: `token ${process.env.GITHUB_TOKEN}` },
+              }
+            );
+
+            if (pomResponse.ok) {
+              const pomData = (await pomResponse.json()) as { content?: string };
+              if (typeof pomData.content === "string") {
+                const pomContent = Buffer.from(pomData.content, "base64").toString("utf-8");
+                const depMatches = pomContent.matchAll(/<artifactId>([^<]+)<\/artifactId>/g);
+                const versionMatches = pomContent.matchAll(/<version>([^<]+)<\/version>/g);
+                const depNames = Array.from(depMatches, (m) => m[1]?.trim()).filter(
+                  (x): x is string => typeof x === "string" && x.length > 0
+                );
+                const depVersions = Array.from(versionMatches, (m) => m[1]?.trim());
+                for (let i = 0; i < depNames.length; i++) {
+                  const depName = depNames[i];
+                  if (seenDepNames.has(depName)) continue;
+                  seenDepNames.add(depName);
+                  auditorDependencyEntries.push({
+                    name: depName,
+                    range: depVersions[i] || "unknown",
+                    kind: "maven",
+                    fromPath: "pom.xml",
+                  });
+                }
+                parsePomDependencies(pomContent, "pom.xml");
+                auditorPomPaths.push("pom.xml");
+                auditorManifestSnippets.push({
+                  path: "pom.xml",
+                  preview: pomContent.slice(0, 4000),
+                });
+              }
+            }
+          } catch {
+            /* fallback to tree paths below */
+          }
+
+          // Additional pom.xml files (multi-module) from the tree.
+          for (const pomPath of pomXmlBlobPaths.slice(0, 6)) {
+            if (pomPath === "pom.xml") continue;
+            try {
+              const { data: blob } = await octokit.repos.getContent({
+                owner,
+                repo,
+                path: pomPath,
+              });
+              if (!("content" in blob)) continue;
+              const pomContent = Buffer.from(blob.content, "base64").toString("utf-8");
+              parsePomDependencies(pomContent, pomPath);
+              auditorPomPaths.push(pomPath);
+              auditorManifestSnippets.push({ path: pomPath, preview: pomContent.slice(0, 4000) });
+            } catch {
+              /* skip unreadable pom.xml */
+            }
+          }
+        }
+
+        if (auditorPackageJsonPaths.length === 0 && gradleBlobPaths.length > 0) {
+          const gradlePattern =
+            /(?:implementation|api|compileOnly|runtimeOnly|testImplementation)\s*\(?\s*["']([^:"'\s]+):([^:"'\s]+):([^"'\s)]+)["']\s*\)?/g;
+          for (const gradlePath of gradleBlobPaths.slice(0, 6)) {
+            try {
+              const { data: blob } = await octokit.repos.getContent({
+                owner,
+                repo,
+                path: gradlePath,
+              });
+              if (!("content" in blob)) continue;
+              const gradleContent = Buffer.from(blob.content, "base64").toString("utf-8");
+              const matches = gradleContent.matchAll(gradlePattern);
+              for (const m of matches) {
+                const artifact = m[2]?.trim();
+                const version = m[3]?.trim() || "unknown";
+                if (!artifact || seenDepNames.has(artifact)) continue;
+                seenDepNames.add(artifact);
+                auditorDependencyEntries.push({
+                  name: artifact,
+                  range: version,
+                  kind: "gradle",
+                  fromPath: gradlePath,
+                });
+              }
+              auditorGradlePaths.push(gradlePath);
+              auditorManifestSnippets.push({
+                path: gradlePath,
+                preview: gradleContent.slice(0, 4000),
+              });
+            } catch {
+              /* skip unreadable build.gradle */
+            }
           }
         }
 
@@ -370,18 +589,30 @@ Return this exact JSON structure:
           msg:
             auditorPackageJsonPaths.length > 0
               ? `Loaded ${auditorPackageJsonPaths.length} package.json file(s): ${auditorPackageJsonPaths.join(", ")}`
+              : auditorPomPaths.length > 0
+                ? `Loaded ${auditorPomPaths.length} pom.xml file(s): ${auditorPomPaths.join(", ")}`
+                : auditorGradlePaths.length > 0
+                  ? `Loaded ${auditorGradlePaths.length} build.gradle file(s): ${auditorGradlePaths.join(", ")}`
               : "No package.json in tree — inferring dependencies from codebase files...",
         });
 
         const riskModel = genAI.getGenerativeModel({
-          model: "gemma-3-27b-it",
+          model: "gemini-2.5-flash",
         });
         const auditorModel = genAI.getGenerativeModel({
-          model: "gemma-3-27b-it",
+          model: "gemini-2.5-flash",
         });
 
         const riskPrompt = `You are a risk detector. Analyze this codebase for issues. Return ONLY valid JSON.
+Project type: ${projectType}
 Files analyzed: ${JSON.stringify(fileContents.map(f => ({ path: f.path, preview: f.content.slice(0, 200) })))}
+
+If project type is Java (Maven or Gradle), prioritize checking for:
+- SQL injection in JDBC calls
+- Deserialization vulnerabilities
+- XXE vulnerabilities in XML parsing
+- Insecure random number generation
+- Hardcoded credentials
 
 For EVERY risk in "risks", you MUST fill these fields using plain English tailored to that specific finding (derive from "issue" and file context):
 - "whatIsThis": 1–3 sentences explaining the vulnerability/issue type for a non-specialist reader.
@@ -413,24 +644,34 @@ Return this exact JSON shape (field names camelCase):
 }`;
 
         const auditorPrompt = `You are a dependency auditor for a GitHub repository.
+Project type: ${projectType}
 
-PRIMARY SOURCE (use this when provided): Declared npm dependencies fetched from actual package.json file(s) in the repo Git tree — not guesses from source paths alone.
+PRIMARY SOURCE (use this when provided): Declared dependencies fetched from real manifest files in the repo Git tree:
+- Node.js: package.json
+- Java/Maven: pom.xml
+- Java/Gradle: build.gradle or build.gradle.kts
 
 Package.json blob paths fetched from repo (excluding node_modules):
 ${JSON.stringify(auditorPackageJsonPaths.length ? auditorPackageJsonPaths : ["(none found)"])}
 
-Declared dependency entries (deduplicated by package name — first occurrence wins when multiple package.json files exist). Fields: name, semver range declared in manifest, dependency kind (dependencies / devDependencies / etc.), originating package.json path:
+pom.xml paths fetched from repo:
+${JSON.stringify(auditorPomPaths.length ? auditorPomPaths : ["(none found)"])}
+
+build.gradle paths fetched from repo:
+${JSON.stringify(auditorGradlePaths.length ? auditorGradlePaths : ["(none found)"])}
+
+Declared dependency entries (deduplicated by package name — first occurrence wins when multiple manifests exist). Fields: name, declared version/range, dependency kind, originating manifest path:
 ${JSON.stringify(auditorDependencyEntries.slice(0, 200))}
 
-Truncated raw package.json excerpts for context:
-${JSON.stringify(auditorPackageJsonSnippets)}
+Truncated raw manifest excerpts for context:
+${JSON.stringify(auditorManifestSnippets)}
 
 Code file paths sampled from the codebase (secondary context):
 ${JSON.stringify(fileContents.map((f) => f.path))}
 
 Instructions:
-1. Prefer analyzing the real manifests above. Reference package names and version ranges exactly as declared.
-2. If no package.json was found, infer dependencies cautiously from file paths only and note that in the summary.
+1. Prefer analyzing the real manifest dependencies above. Reference package names and version ranges exactly as declared.
+2. If no manifest was found, infer dependencies cautiously from file paths only and note that in the summary.
 3. Assess whether entries look outdated, loosely specified, or plausibly vulnerable from general ecosystem knowledge — return conservative severity unless clearly critical.
 
 Return ONLY valid JSON:
@@ -438,7 +679,7 @@ Return ONLY valid JSON:
   "dependencies": [
     {"name": "package", "version": "range or inferred", "status": "vulnerable|outdated|ok", "severity": "critical|warning|ok"}
   ],
-  "summary": "brief summary referencing whether package.json was used"
+  "summary": "brief summary referencing which manifest type was used"
 }`;
 
         const [riskResult, auditResult] = await Promise.all([
@@ -472,7 +713,7 @@ Return ONLY valid JSON:
         send({ agent: "scorer", status: "running", msg: "Calculating health score..." });
 
         const scorerModel = genAI.getGenerativeModel({
-          model: "gemma-3-27b-it",
+          model: "gemini-2.5-flash",
         });
 
         const scorerNodes = Array.isArray(mapperData.nodes) ? mapperData.nodes : [];
@@ -517,6 +758,87 @@ Return exactly this JSON shape:
           console.warn("[scorer] Could not parse JSON from response; using heuristic fallback.");
         }
         const scorerData = normalizeScorerPayload(parsed, fallback);
+
+        const healthScore = scorerData.score;
+        const filesScanned = filesMappedCount;
+        const issuesFound = scorerRisks.length;
+        const riskAnalysis = scorerRisks;
+        const dependencies = scorerDeps;
+
+        let aiInsights: GeminiInsightsShape = {
+          summary:
+            "Analysis complete. Review the findings below for detailed security recommendations.",
+          criticalActions: [],
+          recommendations: [],
+          securityGrade: "C",
+          estimatedFixTime: "2-4 hours",
+        };
+
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          try {
+            // Wait to reduce rate-limit risk before each attempt.
+            await new Promise((resolve) => setTimeout(resolve, 2000));
+
+            const geminiResponse = await fetch(
+              `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  contents: [
+                    {
+                      parts: [
+                        {
+                          text: `Security analysis results:
+Health: ${healthScore}/100
+Issues: ${issuesFound}
+Top risks: ${riskAnalysis
+  ?.slice(0, 3)
+  .map((r) => `${r.file}: ${r.issue}`)
+  .join(", ")}
+Vulnerable deps: ${dependencies
+  ?.filter((d: any) => String(d?.status ?? "").toUpperCase() === "VULNERABLE")
+  .map((d: any) => d?.name || "unknown")
+  .join(", ")}
+
+Return ONLY this JSON, no other text:
+{"summary":"2 sentence summary","criticalActions":[{"action":"action 1","reason":"why","effort":"High"},{"action":"action 2","reason":"why","effort":"Medium"}],"recommendations":["rec 1","rec 2","rec 3","rec 4","rec 5"],"securityGrade":"C","estimatedFixTime":"3-5 hours"}`,
+                        },
+                      ],
+                    },
+                  ],
+                  generationConfig: { maxOutputTokens: 400, temperature: 0.2 },
+                }),
+              }
+            );
+
+            const geminiData = await geminiResponse.json();
+            console.log("Gemini status:", geminiResponse.status);
+
+            if (geminiResponse.ok) {
+              const rawText = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
+              const cleaned = String(rawText).replace(/```json|```/g, "").trim();
+              const parsedInsights = normalizeGeminiInsights(JSON.parse(cleaned));
+              if (parsedInsights) {
+                aiInsights = parsedInsights;
+                console.log("Gemini insights success:", aiInsights);
+                break;
+              }
+              console.log("Gemini returned invalid insights shape; using fallback.");
+            } else {
+              console.log("Gemini failed, using fallback. Status:", geminiResponse.status);
+            }
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            console.error("Gemini insights error:", msg);
+          }
+        }
+
+        (scorerData as ScorerShape & { aiInsights?: GeminiInsightsShape }).aiInsights =
+          aiInsights;
+        if (aiInsights.recommendations.length > 0) {
+          scorerData.recommendations = aiInsights.recommendations;
+        }
 
         send({ agent: "scorer", status: "done", data: scorerData, msg: `Health score: ${scorerData.score}/100` });
         send({ agent: "complete", status: "done", msg: "Analysis complete!" });

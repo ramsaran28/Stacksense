@@ -1174,6 +1174,37 @@ export default function Dashboard() {
   const kpiFiles = results?.mapper?.nodes?.length ?? 0;
   const kpiIssues = results?.risk?.risks?.length ?? 0;
   const kpiDeps = results?.auditor?.dependencies?.length ?? 0;
+  const aiInsights = (results?.scorer?.aiInsights as
+    | {
+        summary?: string;
+        criticalActions?: { action?: string; reason?: string; effort?: "Low" | "Medium" | "High" }[];
+        recommendations?: string[];
+        securityGrade?: "A" | "B" | "C" | "D" | "F";
+        estimatedFixTime?: string;
+      }
+    | undefined) ?? {
+    summary: "",
+    criticalActions: [],
+    recommendations: [],
+    securityGrade: "C",
+    estimatedFixTime: "",
+  };
+  const insightsRecommendations =
+    Array.isArray(aiInsights.recommendations) && aiInsights.recommendations.length > 0
+      ? aiInsights.recommendations.slice(0, 5)
+      : Array.isArray(results?.scorer?.recommendations)
+        ? (results.scorer.recommendations as string[]).slice(0, 5)
+        : [];
+  const insightsCriticalActions = Array.isArray(aiInsights.criticalActions)
+    ? aiInsights.criticalActions.slice(0, 5)
+    : [];
+  const securityGrade = ["A", "B", "C", "D", "F"].includes(String(aiInsights.securityGrade))
+    ? (aiInsights.securityGrade as "A" | "B" | "C" | "D" | "F")
+    : "C";
+  const securityGradeColor = securityGrade === "A" || securityGrade === "B" ? "#28ca41" : securityGrade === "C" ? "#ffbd2e" : "#ff5f57";
+  const estimatedFixTime = typeof aiInsights.estimatedFixTime === "string" && aiInsights.estimatedFixTime.trim()
+    ? aiInsights.estimatedFixTime.trim()
+    : "Unknown";
 
   const exportPDF = useCallback(() => {
     if (!results || typeof window === "undefined") return;
@@ -2400,24 +2431,156 @@ export default function Dashboard() {
                   fontWeight: 700,
                 }}
               >
-                AI recommendations
+                AI insights
               </div>
-              {results.scorer?.recommendations?.map((rec: string, i: number) => (
-                <div key={i} style={{ display: "flex", gap: "10px", marginBottom: "12px" }}>
-                  <div
-                    style={{
-                      width: 6,
-                      height: 6,
-                      borderRadius: "50%",
-                      background: ACCENT,
-                      marginTop: 6,
-                      flexShrink: 0,
-                      boxShadow: `0 0 10px ${ACCENT}88`,
-                    }}
-                  />
-                  <p style={{ fontSize: 15, color: TEXT_DESC, lineHeight: 1.6, margin: 0 }}>{rec}</p>
+              <div style={{ marginBottom: 20 }}>
+                <div
+                  style={{
+                    fontFamily: "IBM Plex Mono, monospace",
+                    fontSize: 11,
+                    color: "#6F9487",
+                    marginBottom: 8,
+                    letterSpacing: "0.08em",
+                    textTransform: "uppercase",
+                  }}
+                >
+                  Security Grade
                 </div>
-              ))}
+                <div
+                  style={{
+                    fontFamily: "DM Serif Display, serif",
+                    fontSize: 64,
+                    lineHeight: 1,
+                    color: securityGradeColor,
+                  }}
+                >
+                  {securityGrade}
+                </div>
+              </div>
+
+              <div
+                style={{
+                  background: "#092828",
+                  border: "1px solid #163E3C",
+                  borderRadius: 12,
+                  padding: "24px",
+                  marginBottom: 20,
+                }}
+              >
+                <div
+                  style={{
+                    fontFamily: "IBM Plex Mono, monospace",
+                    fontSize: 11,
+                    color: "#325F57",
+                    marginBottom: 10,
+                    letterSpacing: "0.08em",
+                  }}
+                >
+                  ▸ EXECUTIVE SUMMARY
+                </div>
+                <p style={{ fontFamily: "Outfit, sans-serif", fontSize: 16, color: "#b8d4c8", lineHeight: 1.8, margin: 0 }}>
+                  {aiInsights.summary?.trim() || "No executive summary returned yet."}
+                </p>
+              </div>
+
+              <div style={{ marginBottom: 16 }}>
+                <div
+                  style={{
+                    fontFamily: "IBM Plex Mono, monospace",
+                    fontSize: 11,
+                    color: "#ff5f57",
+                    marginBottom: 10,
+                    letterSpacing: "0.08em",
+                  }}
+                >
+                  ▸ CRITICAL ACTIONS
+                </div>
+                {insightsCriticalActions.length > 0 ? (
+                  insightsCriticalActions.map((item, i) => {
+                    const effort = item.effort === "Low" || item.effort === "Medium" || item.effort === "High" ? item.effort : "Medium";
+                    const effortColor = effort === "Low" ? "#28ca41" : effort === "Medium" ? "#ffbd2e" : "#ff5f57";
+                    return (
+                      <div
+                        key={`critical-action-${i}`}
+                        style={{
+                          padding: "12px 0",
+                          borderBottom: i < insightsCriticalActions.length - 1 ? "1px solid #163E3C" : "none",
+                          display: "flex",
+                          alignItems: "flex-start",
+                          justifyContent: "space-between",
+                          gap: 12,
+                        }}
+                      >
+                        <div style={{ minWidth: 0 }}>
+                          <div style={{ fontFamily: "Outfit, sans-serif", fontSize: 15, color: "#ffffff", fontWeight: 500, lineHeight: 1.6 }}>
+                            {item.action || "Action pending"}
+                          </div>
+                          <div style={{ fontFamily: "Outfit, sans-serif", fontSize: 14, color: "#b8d4c8", lineHeight: 1.7, marginTop: 2 }}>
+                            {item.reason || "Reason not provided."}
+                          </div>
+                        </div>
+                        <span
+                          style={{
+                            fontFamily: "IBM Plex Mono, monospace",
+                            fontSize: 11,
+                            color: effortColor,
+                            background:
+                              effort === "Low"
+                                ? "rgba(40,202,65,0.15)"
+                                : effort === "Medium"
+                                  ? "rgba(255,189,46,0.15)"
+                                  : "rgba(255,95,87,0.15)",
+                            border: `1px solid ${effortColor}55`,
+                            borderRadius: 999,
+                            padding: "4px 10px",
+                            flexShrink: 0,
+                            marginTop: 2,
+                          }}
+                        >
+                          {effort}
+                        </span>
+                      </div>
+                    );
+                  })
+                ) : (
+                  <p style={{ margin: 0, color: "#b8d4c8", fontSize: 14 }}>No critical actions returned yet.</p>
+                )}
+              </div>
+
+              <div
+                style={{
+                  fontFamily: "IBM Plex Mono, monospace",
+                  fontSize: 12,
+                  color: "#6F9487",
+                  marginBottom: 16,
+                }}
+              >
+                Estimated remediation time: {estimatedFixTime}
+              </div>
+
+              <div
+                style={{
+                  fontFamily: "IBM Plex Mono, monospace",
+                  fontSize: 11,
+                  color: "#325F57",
+                  marginBottom: 10,
+                  letterSpacing: "0.08em",
+                }}
+              >
+                ▸ DETAILED RECOMMENDATIONS
+              </div>
+              {insightsRecommendations.length > 0 ? (
+                insightsRecommendations.map((rec: string, i: number) => (
+                  <div key={`insight-rec-${i}`} style={{ display: "flex", gap: "10px", marginBottom: "12px" }}>
+                    <div style={{ color: "#325F57", marginTop: 1, fontSize: 14, lineHeight: 1.6 }}>▸</div>
+                    <p style={{ fontFamily: "Outfit, sans-serif", fontSize: 15, color: "#b8d4c8", lineHeight: 1.6, margin: 0 }}>
+                      {rec}
+                    </p>
+                  </div>
+                ))
+              ) : (
+                <p style={{ margin: 0, color: "#b8d4c8", fontSize: 14 }}>No recommendations returned yet.</p>
+              )}
             </div>
           </section>
 
