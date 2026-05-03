@@ -304,7 +304,14 @@ function HealthScoreRing({ score }: { score: number }) {
   );
 }
 
-type MapperNode = { id: string; risk?: string; deps?: number };
+type MapperNode = {
+  id: string;
+  risk?: string;
+  deps?: number;
+  name?: string;
+  path?: string;
+  size?: number;
+};
 type MapperEdge = { source: string; target: string };
 
 type SimNode = d3.SimulationNodeDatum & MapperNode;
@@ -441,12 +448,12 @@ function mergeMapperNodesWithRisks(nodes: MapperNode[], risks: RiskListItem[]): 
 const GRAPH_VIEW_HEIGHT = 550;
 
 function CodebaseMapGraph({
-  nodes,
-  edges,
+  nodes = [],
+  edges = [],
   onSelectNode,
 }: {
-  nodes: MapperNode[];
-  edges: MapperEdge[];
+  nodes?: MapperNode[];
+  edges?: MapperEdge[];
   onSelectNode: (node: MapperNode | null) => void;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -455,9 +462,21 @@ function CodebaseMapGraph({
   const reactId = useId().replace(/:/g, "");
   const [legendOpen, setLegendOpen] = useState(false);
   const legendUiRef = useRef<HTMLDivElement>(null);
+  const [layoutWidth, setLayoutWidth] = useState(0);
 
   const onSelectNodeRef = useRef(onSelectNode);
   onSelectNodeRef.current = onSelectNode;
+
+  /** Primitives only — useEffect deps stay fixed-length (no spreads / conditional slots). */
+  const mapGraphDataSignature = useMemo(
+    () =>
+      JSON.stringify({
+        rid: reactId,
+        ns: nodes.map((n) => [n.id, n.risk ?? "", n.deps ?? 0] as const),
+        es: edges.map((e) => [e.source, e.target] as const),
+      }),
+    [nodes, edges, reactId]
+  );
 
   useEffect(() => {
     if (!legendOpen) return;
@@ -470,11 +489,30 @@ function CodebaseMapGraph({
   }, [legendOpen]);
 
   useEffect(() => {
+    if (nodes.length === 0) return;
+    const el = containerRef.current;
+    if (!el) return;
+    if (typeof ResizeObserver === "undefined") {
+      setLayoutWidth(el.clientWidth);
+      return;
+    }
+    const ro = new ResizeObserver(() => {
+      const w = el.clientWidth;
+      setLayoutWidth((prev) => (Math.abs(prev - w) > 0.5 ? w : prev));
+    });
+    ro.observe(el);
+    setLayoutWidth(el.clientWidth);
+    return () => ro.disconnect();
+  },
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: ref.current attachment as dependency slots
+  [containerRef.current, svgRef.current]);
+
+  useEffect(() => {
     if (!containerRef.current || !svgRef.current || nodes.length === 0) return;
 
     const container = containerRef.current;
     const svg = d3.select(svgRef.current);
-    const width = container.clientWidth;
+    const width = Math.max(layoutWidth || container.clientWidth, 1);
     const height = GRAPH_VIEW_HEIGHT;
 
     svg.attr("width", width).attr("height", height).attr("viewBox", `0 0 ${width} ${height}`);
@@ -777,7 +815,9 @@ function CodebaseMapGraph({
       simulation.stop();
       simulationRef.current = null;
     };
-  }, [nodes, edges, reactId]);
+  },
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- layoutWidth read inside; signature + length per dashboard contract
+  [mapGraphDataSignature, nodes.length]);
 
   if (nodes.length === 0) {
     return (
@@ -2843,50 +2883,98 @@ export default function Dashboard() {
               >
                 dependency audit
               </div>
-              {results.auditor?.dependencies?.slice(0, 8).map((dep: any, i: number) => (
-                <div
-                  key={i}
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: "8px",
-                    padding: "10px 0",
-                    borderBottom: `1px solid ${GLASS_BORDER}`,
-                  }}
-                >
-                  <span
-                    style={{
-                      fontSize: 14,
-                      fontWeight: 500,
-                      color: TEXT_HEADING,
-                      fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, monospace",
-                      flex: 1,
-                    }}
-                  >
-                    {dep.name}
-                  </span>
-                  <span style={{ fontSize: 13, color: TEXT_LABEL }}>{dep.version}</span>
-                  <span
-                    style={{
-                      fontSize: 11,
-                      padding: "4px 10px",
-                      borderRadius: 20,
-                      fontWeight: 600,
-                      letterSpacing: "0.04em",
-                      textTransform: "uppercase",
-                      background:
-                        dep.status === "vulnerable"
-                          ? "rgba(201,107,92,0.15)"
-                          : dep.status === "outdated"
-                            ? "rgba(217,162,60,0.12)"
-                            : "rgba(111,148,135,0.15)",
-                      color: dep.status === "vulnerable" ? DANGER : dep.status === "outdated" ? WARNING : SUCCESS,
-                    }}
-                  >
-                    {dep.status}
-                  </span>
-                </div>
-              ))}
+              {(() => {
+                const auditDeps = (results.auditor?.dependencies ?? []) as Array<{
+                  name?: string;
+                  version?: string;
+                  status?: string;
+                  issue?: string;
+                }>;
+                if (auditDeps.length === 0) {
+                  return (
+                    <p style={{ margin: 0, color: TEXT_DESC, fontSize: 15, lineHeight: 1.6 }}>
+                      No dependency issues found.
+                    </p>
+                  );
+                }
+                return auditDeps.slice(0, 8).map((dep, i) => {
+                  const rawSt = String(dep.status ?? "ok").toLowerCase().replace(/-/g, "");
+                  const statusNorm =
+                    rawSt === "vulnerable" ? "vulnerable" : rawSt === "outdated" ? "outdated" : "ok";
+                  const name = dep.name?.trim() || "unknown package";
+                  const version = dep.version?.trim() || "—";
+                  const issue = dep.issue?.trim() || "—";
+                  return (
+                    <div
+                      key={`${name}-${i}`}
+                      style={{
+                        padding: "12px 0",
+                        borderBottom: `1px solid ${GLASS_BORDER}`,
+                      }}
+                    >
+                      <div style={{ display: "flex", alignItems: "flex-start", gap: "10px", flexWrap: "wrap" }}>
+                        <span
+                          style={{
+                            fontSize: 14,
+                            fontWeight: 500,
+                            color: TEXT_HEADING,
+                            fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, monospace",
+                            flex: "1 1 160px",
+                            minWidth: 0,
+                          }}
+                        >
+                          {name}
+                        </span>
+                        <span
+                          style={{
+                            fontSize: 13,
+                            color: TEXT_LABEL,
+                            fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, monospace",
+                          }}
+                        >
+                          {version}
+                        </span>
+                        <span
+                          style={{
+                            fontSize: 11,
+                            padding: "4px 10px",
+                            borderRadius: 20,
+                            fontWeight: 600,
+                            letterSpacing: "0.04em",
+                            textTransform: "uppercase",
+                            flexShrink: 0,
+                            background:
+                              statusNorm === "vulnerable"
+                                ? "rgba(201,107,92,0.15)"
+                                : statusNorm === "outdated"
+                                  ? "rgba(217,162,60,0.12)"
+                                  : "rgba(111,148,135,0.15)",
+                            color:
+                              statusNorm === "vulnerable"
+                                ? DANGER
+                                : statusNorm === "outdated"
+                                  ? WARNING
+                                  : SUCCESS,
+                          }}
+                        >
+                          {statusNorm}
+                        </span>
+                      </div>
+                      <p
+                        style={{
+                          margin: "8px 0 0",
+                          fontSize: 13,
+                          color: TEXT_DESC,
+                          lineHeight: 1.65,
+                          fontFamily: "Outfit, sans-serif",
+                        }}
+                      >
+                        {issue}
+                      </p>
+                    </div>
+                  );
+                });
+              })()}
             </div>
           </section>
         </>
