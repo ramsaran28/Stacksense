@@ -1211,7 +1211,9 @@ export default function Dashboard() {
   const navTitle = NAV_ITEMS.find((n) => n.id === activeNavId)?.label ?? "Overview";
   const healthScore = results ? Number(results.scorer?.score ?? 0) : null;
 
-  const kpiFiles = results?.mapper?.nodes?.length ?? 0;
+  const kpiFiles =
+    (results?.mapper as { stats?: { repoFilesMatched?: number } } | undefined)?.stats
+      ?.repoFilesMatched ?? results?.mapper?.nodes?.length ?? 0;
   const kpiIssues = results?.risk?.risks?.length ?? 0;
   const kpiDeps = results?.auditor?.dependencies?.length ?? 0;
   const aiInsights = (results?.scorer?.aiInsights as
@@ -1574,8 +1576,8 @@ export default function Dashboard() {
       </div>
 
       <div class="footer">
-        <span>StackSense · AI-powered codebase intelligence · BeaverHacks 2026</span>
-        <span>stacksense.app · Powered by Google Gemini AI</span>
+        <span>StackSense · AI-powered codebase intelligence</span>
+        <span>stacksense.app · Powered by Meta Llama · Groq API</span>
       </div>
     </body>
     </html>

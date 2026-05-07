@@ -239,7 +239,7 @@ export default function About() {
             marginBottom: "2rem",
           }}
         >
-          ▸ BEAVERHACKS 2026 · OPEN BETA
+          ▸ OPEN BETA
         </div>
         <h1
           style={{
@@ -388,7 +388,7 @@ export default function About() {
               marginBottom: "1.5rem",
             }}
           >
-            ▸ BUILT AT BEAVERHACKS 2026 · OREGON STATE UNIVERSITY
+            ▸ SHIPPED FAST · STILL IMPROVING
           </div>
           <h2 style={{ fontFamily: "DM Serif Display, serif", fontSize: "48px", color: "#ffffff", marginBottom: "0.5rem" }}>
             Built in 24 hours.
@@ -418,7 +418,7 @@ export default function About() {
             safe.
           </p>
           <div style={{ display: "flex", gap: "12px", justifyContent: "center", flexWrap: "wrap" }}>
-            {["Google Gemini AI", "Next.js 14", "TypeScript", "D3.js", "Tailwind CSS", "Vercel"].map((t) => (
+            {["Meta Llama", "Groq API", "Next.js 14", "TypeScript", "D3.js", "Tailwind CSS", "Vercel"].map((t) => (
               <span
                 key={t}
                 style={{

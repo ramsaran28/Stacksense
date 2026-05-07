@@ -195,6 +195,65 @@
   transform-origin: center;
 }
 
+/* Legal / marketing subpages — staggered entrance (landing-adjacent) */
+@keyframes stacksense-legal-fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(18px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.stacksense-legal-enter {
+  animation: stacksense-legal-fade-up 0.65s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.stacksense-legal-enter-d0 {
+  animation-delay: 0ms;
+}
+.stacksense-legal-enter-d1 {
+  animation-delay: 0.09s;
+}
+.stacksense-legal-enter-d2 {
+  animation-delay: 0.18s;
+}
+.stacksense-legal-enter-d3 {
+  animation-delay: 0.27s;
+}
+.stacksense-legal-enter-d4 {
+  animation-delay: 0.36s;
+}
+.stacksense-legal-enter-d5 {
+  animation-delay: 0.45s;
+}
+.stacksense-legal-enter-d6 {
+  animation-delay: 0.54s;
+}
+.stacksense-legal-enter-d7 {
+  animation-delay: 0.63s;
+}
+.stacksense-legal-enter-d8 {
+  animation-delay: 0.72s;
+}
+.stacksense-legal-enter-d9 {
+  animation-delay: 0.81s;
+}
+.stacksense-legal-enter-d10 {
+  animation-delay: 0.9s;
+}
+
+.stacksense-legal-panel {
+  background: rgba(9, 40, 40, 0.45);
+  border: 1px solid rgba(50, 95, 87, 0.22);
+  border-radius: 16px;
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  box-shadow: inset 0 1px 0 rgba(111, 148, 135, 0.06);
+}
+
 @keyframes stacksense-agent-card-pulse {
   0%,
   100% {

@@ -3,7 +3,7 @@
 import * as d3 from "d3"
 import { useState, useEffect, useRef, useCallback, type Dispatch, type SetStateAction } from "react"
 import Link from "next/link"
-import { StackSenseLogo } from "@/components/stacksense-logo"
+import { MarketingLogoLink, MarketingNavbar } from "@/components/marketing-navbar"
 
 // ============================================================================
 // TYPES
@@ -155,17 +155,6 @@ function CanvasBackground() {
 }
 
 // ============================================================================
-// LOGO COMPONENT
-// ============================================================================
-function Logo() {
-  return (
-    <Link href="/" className="flex items-center" style={{ textDecoration: "none", color: "inherit" }}>
-      <StackSenseLogo />
-    </Link>
-  )
-}
-
-// ============================================================================
 // STATUS BAR
 // ============================================================================
 function StatusBar() {
@@ -202,55 +191,6 @@ function StatusBar() {
         </span>
       </div>
     </div>
-  )
-}
-
-// ============================================================================
-// NAVBAR
-// ============================================================================
-function Navbar() {
-  return (
-    <nav className="fixed left-0 right-0 top-0 z-50 border-b border-[rgba(50,95,87,0.2)] bg-[rgba(4,21,26,0.85)] backdrop-blur-[16px]">
-      <div className="mx-auto max-w-7xl px-8">
-        <div className="flex h-16 items-center justify-between">
-          <Logo />
-
-          <div className="hidden items-center gap-10 md:flex">
-            {(
-              [
-                { label: "Features", href: "/#features" },
-                { label: "How it works", href: "/#how-it-works" },
-                { label: "Agents", href: "/#agents" },
-                { label: "About", href: "/about" },
-              ] as const
-            ).map((item) => (
-              <Link
-                key={item.label}
-                href={item.href}
-                className="font-sans text-[15px] text-[#c4ddd5] transition-colors hover:text-[#ffffff]"
-              >
-                {item.label}
-              </Link>
-            ))}
-          </div>
-
-          <div className="flex items-center gap-4">
-            <Link
-              href="/dashboard"
-              className="font-sans text-[15px] text-[#c4ddd5] transition-colors hover:text-[#ffffff]"
-            >
-              Sign in
-            </Link>
-            <Link
-              href="/dashboard"
-              className="rounded-md bg-[#325F57] px-6 py-2.5 font-sans text-[14px] font-semibold text-[#04151A] transition-colors hover:bg-[#7ab8a4]"
-            >
-              Get started free &rarr;
-            </Link>
-          </div>
-        </div>
-      </div>
-    </nav>
   )
 }
 
@@ -475,13 +415,6 @@ function Hero({
     <section className="relative flex min-h-screen items-center justify-center pt-24">
       <div className="relative z-10 mx-auto w-full max-w-7xl px-8">
         <div className="flex flex-col items-center text-center">
-          {/* Badge */}
-          <div className="mb-6 inline-flex items-center rounded-full border border-[rgba(94,180,154,0.4)] bg-[rgba(50,95,87,0.15)] px-4 py-1.5">
-            <span className="font-mono text-[11px] text-[#5ca68a]">
-              &#9656; Presented at BeaverHacks 2026 · Open Beta
-            </span>
-          </div>
-
           {/* Headlines */}
           <h1 className="font-serif text-[clamp(56px,10vw,88px)] font-normal leading-[1.0] tracking-tight text-[#ffffff]">
             Your codebase
@@ -1040,7 +973,7 @@ function AgentsSection() {
   ]
 
   return (
-    <section id="agents" className="relative z-10 py-32">
+    <section id="agents" className="relative z-10 scroll-mt-24 py-32">
       <div className="mx-auto max-w-7xl px-8">
         {/* Section label */}
         <div className="text-center">
@@ -1159,7 +1092,7 @@ function HowItWorksSection() {
   ]
 
   return (
-    <section id="how-it-works" className="relative z-10 py-32">
+    <section id="how-it-works" className="relative z-10 scroll-mt-24 py-32">
       <div className="mx-auto max-w-7xl px-8">
         {/* Section label */}
         <div className="text-center">
@@ -1203,7 +1136,7 @@ function HowItWorksSection() {
 // ============================================================================
 function FeaturesSection() {
   return (
-    <section id="features" className="relative z-10 py-32">
+    <section id="features" className="relative z-10 scroll-mt-24 py-32">
       <div className="mx-auto max-w-7xl px-8">
         <h2 className="text-center font-serif text-[clamp(36px,6vw,52px)] font-normal leading-[1.1] text-[#ffffff]">
           Everything you need to ship secure code.
@@ -1331,11 +1264,6 @@ function FinalCTA({
       </div>
 
       <div className="relative z-10 mx-auto max-w-7xl px-8 text-center">
-        {/* Badge */}
-        <span className="mb-6 inline-flex rounded-full border border-[rgba(50,95,87,0.4)] bg-[rgba(50,95,87,0.15)] px-4 py-1.5 font-mono text-[11px] text-[#7ab8a4]">
-          Open Beta · BeaverHacks 2026
-        </span>
-
         <h2 className="font-serif text-[clamp(44px,8vw,72px)] font-normal leading-[1.0] text-[#ffffff]">
           Your codebase has been waiting.
         </h2>
@@ -1376,39 +1304,48 @@ function FinalCTA({
 // ============================================================================
 // FOOTER
 // ============================================================================
+const FOOTER_NAV = [
+  { label: "Features", href: "/#features" },
+  { label: "Agents", href: "/#agents" },
+  { label: "How it works", href: "/#how-it-works" },
+  { label: "Privacy", href: "/privacy" },
+  { label: "Terms", href: "/terms" },
+] as const
+
 function Footer() {
   return (
     <footer className="relative z-10 border-t border-[#163E3C] bg-[#092828] px-8 py-6">
       <div className="mx-auto max-w-7xl">
         <div className="flex flex-col items-center justify-between gap-4 md:flex-row">
           <div className="flex items-center gap-4">
-            <Logo />
+            <MarketingLogoLink />
             <span className="font-mono text-[11px] text-[#7ab8a4]">
               AI-powered codebase intelligence
             </span>
           </div>
 
-          <div className="flex flex-wrap items-center gap-6">
-            {["Features", "Agents", "How it works", "Privacy", "Terms"].map(
-              (link) => (
-                <Link
-                  key={link}
-                  href="#"
-                  className="font-sans text-[14px] text-[#7ab8a4] transition-colors hover:text-[#ffffff]"
-                >
-                  {link}
-                </Link>
-              )
-            )}
-          </div>
+          <nav
+            aria-label="Footer"
+            className="flex flex-wrap items-center justify-center gap-6"
+          >
+            {FOOTER_NAV.map(({ label, href }) => (
+              <Link
+                key={label}
+                href={href}
+                className="font-sans text-[14px] text-[#7ab8a4] transition-colors hover:text-[#ffffff]"
+              >
+                {label}
+              </Link>
+            ))}
+          </nav>
         </div>
 
         <div className="mt-4 flex flex-col items-center justify-between gap-2 border-t border-[#163E3C] pt-4 md:flex-row">
           <span className="font-mono text-[11px] text-[#7ab8a4]">
-            &copy; 2026 StackSense · Built at BeaverHacks 2026
+            &copy; 2026 StackSense
           </span>
           <span className="font-mono text-[11px] text-[#7ab8a4]">
-            Made with Gemini AI · Google Cloud
+            Made with Meta Llama · Groq API
           </span>
         </div>
       </div>
@@ -1425,7 +1362,7 @@ export default function Home() {
   return (
     <main className="relative min-h-screen bg-[#04151A]">
       <CanvasBackground />
-      <Navbar />
+      <MarketingNavbar />
       <StatusBar />
       <Hero showDemo={showDemo} setShowDemo={setShowDemo} />
       <SocialProofBar />

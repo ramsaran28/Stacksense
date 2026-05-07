@@ -1,27 +1,308 @@
 import { Octokit } from "@octokit/rest";
 
-const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
+import { parseValidatedGitHubRepositoryUrl } from "@/lib/github-url";
+import {
+  isDependencyManifestPath,
+  parseManifestByPath,
+  type ManifestDepEntry,
+} from "@/lib/manifest-parsers";
+
+function createGithubClient(): Octokit {
+  const auth = process.env.GITHUB_TOKEN?.trim();
+  return auth ? new Octokit({ auth }) : new Octokit();
+}
+
+function requireGroqConfigured(): string | null {
+  const key = process.env.GROQ_API_KEY?.trim();
+  if (!key) return "Set GROQ_API_KEY in your environment (e.g. .env.local for local development).";
+  return null;
+}
+
+function stringifyError(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return String(error);
+  }
+}
+
+const MAX_GRAPH_PATHS = 220;
+const MAX_BLOB_CONTENT_FETCHES = 72;
+const MAX_MANIFEST_PATHS_FETCH = 42;
+
+const EXCLUDED_PATH_SEGMENTS = new Set([
+  "node_modules",
+  "vendor",
+  ".git",
+  "__pycache__",
+  ".venv",
+  "venv",
+  "dist",
+  "build",
+  "target",
+  ".next",
+  ".nuxt",
+  "coverage",
+  ".turbo",
+  "pods",
+  "deriveddata",
+]);
+
+function shouldExcludeRepoPath(path: string): boolean {
+  const norm = path.replace(/\\/g, "/").toLowerCase();
+  const segments = norm.split("/");
+  for (const seg of segments) {
+    if (EXCLUDED_PATH_SEGMENTS.has(seg)) return true;
+  }
+  return false;
+}
+
+function mapperBasename(p: string): string {
+  const t = p.trim().replace(/\\/g, "/");
+  const parts = t.split("/");
+  return parts[parts.length - 1] || t;
+}
+
+function languageBucketForPath(path: string): string {
+  const pl = path.replace(/\\/g, "/").toLowerCase();
+  const base = mapperBasename(pl);
+  if (pl.includes(".github/workflows/") && (base.endsWith(".yml") || base.endsWith(".yaml")))
+    return "workflow";
+  if (base === "dockerfile" || pl.endsWith("/dockerfile")) return "docker";
+  if (
+    pl.endsWith("docker-compose.yml") ||
+    pl.endsWith("docker-compose.yaml")
+  )
+    return "docker";
+  if (
+    pl.endsWith(".ts") ||
+    pl.endsWith(".tsx") ||
+    pl.endsWith(".js") ||
+    pl.endsWith(".jsx") ||
+    pl.endsWith(".mjs") ||
+    pl.endsWith(".cjs")
+  )
+    return "js";
+  if (pl.endsWith(".py")) return "py";
+  if (pl.endsWith(".java")) return "java";
+  if (pl.endsWith(".go")) return "go";
+  if (pl.endsWith(".rs")) return "rust";
+  if (pl.endsWith(".rb")) return "ruby";
+  if (pl.endsWith(".php")) return "php";
+  if (pl.endsWith(".swift")) return "swift";
+  if (pl.endsWith(".kt") || pl.endsWith(".kts")) return "kotlin";
+  if (pl.endsWith(".sh") || pl.endsWith(".bash")) return "shell";
+  if (pl.endsWith(".cpp") || pl.endsWith(".cc") || pl.endsWith(".cxx") || pl.endsWith(".hpp"))
+    return "cpp";
+  if (pl.endsWith(".c") || pl.endsWith(".h")) return "c";
+  if (pl.endsWith(".yaml") || pl.endsWith(".yml") || pl.endsWith(".toml") || pl.endsWith(".ini"))
+    return "config";
+  if (base.startsWith(".env")) return "env";
+  return "other";
+}
+
+function manifestPriority(path: string): number {
+  const b = mapperBasename(path).toLowerCase();
+  const order = [
+    "package.json",
+    "cargo.toml",
+    "go.mod",
+    "requirements.txt",
+    "pipfile",
+    "pyproject.toml",
+    "gemfile",
+    "composer.json",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "dockerfile",
+    "docker-compose.yml",
+    "docker-compose.yaml",
+  ];
+  const i = order.indexOf(b);
+  if (i >= 0) return i;
+  if (path.replace(/\\/g, "/").includes(".github/workflows/")) return order.length;
+  return 100;
+}
+
+/** All source/config blobs we analyze (full tree walk; no extension cap). */
+function isAnalyzableBlobPath(path: string | undefined): boolean {
+  if (!path || shouldExcludeRepoPath(path)) return false;
+  const pl = path.replace(/\\/g, "/");
+  const lower = pl.toLowerCase();
+  const base = mapperBasename(lower);
+
+  if (base === "dockerfile" || lower.endsWith("/dockerfile")) return true;
+  if (lower.endsWith("docker-compose.yml") || lower.endsWith("docker-compose.yaml")) return true;
+  if (
+    base === "requirements.txt" ||
+    base === "pipfile" ||
+    base === "pyproject.toml" ||
+    base === "cargo.toml" ||
+    base === "go.mod" ||
+    base === "gemfile" ||
+    base === "composer.json" ||
+    base === "pom.xml" ||
+    base === "build.gradle" ||
+    base === "build.gradle.kts"
+  )
+    return true;
+  if (base === "package.json" || lower.endsWith("/package.json")) return true;
+  if (lower.includes(".github/workflows/") && (base.endsWith(".yml") || base.endsWith(".yaml")))
+    return true;
+  if (base.startsWith(".env")) return true;
+
+  const suffixes = [
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".mjs",
+    ".cjs",
+    ".py",
+    ".java",
+    ".go",
+    ".rb",
+    ".php",
+    ".rs",
+    ".swift",
+    ".kt",
+    ".kts",
+    ".cpp",
+    ".cc",
+    ".cxx",
+    ".hpp",
+    ".h",
+    ".sh",
+    ".bash",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".ini",
+    ".c",
+  ];
+  if (suffixes.some((s) => lower.endsWith(s))) return true;
+
+  return false;
+}
+
+function diversePathSample(allPaths: string[], max: number): string[] {
+  if (allPaths.length <= max) return [...allPaths];
+
+  const manifestPaths = allPaths.filter(isDependencyManifestPath);
+  const chosen = new Set<string>();
+  const sortedManifests = [...manifestPaths].sort(
+    (a, b) => manifestPriority(a) - manifestPriority(b) || a.localeCompare(b)
+  );
+  for (const p of sortedManifests) {
+    if (chosen.size >= max) break;
+    chosen.add(p);
+  }
+
+  const buckets = new Map<string, string[]>();
+  for (const p of allPaths) {
+    if (chosen.has(p)) continue;
+    const bucket = languageBucketForPath(p);
+    if (!buckets.has(bucket)) buckets.set(bucket, []);
+    buckets.get(bucket)!.push(p);
+  }
+  const keys = [...buckets.keys()].sort();
+
+  for (;;) {
+    let added = false;
+    for (const k of keys) {
+      const arr = buckets.get(k);
+      if (!arr || arr.length === 0) continue;
+      chosen.add(arr.shift()!);
+      added = true;
+      if (chosen.size >= max) break;
+    }
+    if (!added || chosen.size >= max) break;
+  }
+
+  return [...chosen];
+}
+
+function buildContentFetchOrder(graphPaths: string[], max: number): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const manifests = graphPaths
+    .filter(isDependencyManifestPath)
+    .sort((a, b) => manifestPriority(a) - manifestPriority(b) || a.localeCompare(b));
+  for (const p of manifests) {
+    if (out.length >= max) break;
+    if (!seen.has(p)) {
+      seen.add(p);
+      out.push(p);
+    }
+  }
+  for (const p of graphPaths) {
+    if (out.length >= max) break;
+    if (!seen.has(p)) {
+      seen.add(p);
+      out.push(p);
+    }
+  }
+  return out;
+}
 
 type GroqOptions = { max_tokens?: number; temperature?: number };
 
+/**
+ * Credentials and endpoint are read only from env (typically `.env.local` in dev).
+ * See: GROQ_API_KEY (required), GROQ_CHAT_COMPLETIONS_URL, GROQ_MODEL.
+ */
 async function groqChatCompletion(prompt: string, options?: GroqOptions): Promise<string> {
-  const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "llama-3.3-70b-versatile",
-      messages: [{ role: "user", content: prompt }],
-      max_tokens: options?.max_tokens ?? 500,
-      temperature: options?.temperature ?? 0.2,
-    }),
-  });
-  const data = (await response.json()) as {
-    choices?: Array<{ message?: { content?: string } }>;
-  };
-  return data.choices?.[0]?.message?.content || "{}";
+  const apiKey = process.env.GROQ_API_KEY?.trim();
+  if (!apiKey) {
+    throw new Error("GROQ_API_KEY is not configured.");
+  }
+  const url =
+    process.env.GROQ_CHAT_COMPLETIONS_URL?.trim() ||
+    "https://api.groq.com/openai/v1/chat/completions";
+  const model =
+    process.env.GROQ_MODEL?.trim() || "llama-3.3-70b-versatile";
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: "user", content: prompt }],
+        max_tokens: options?.max_tokens ?? 500,
+        temperature: options?.temperature ?? 0.2,
+      }),
+    });
+  } catch (cause) {
+    throw new Error(`Groq network error: ${stringifyError(cause)}`);
+  }
+
+  const rawText = await response.text().catch(() => "");
+
+  try {
+    const data = JSON.parse(rawText) as {
+      choices?: Array<{ message?: { content?: string } }>;
+      error?: { message?: string };
+    };
+    if (!response.ok) {
+      const groqDetail = data?.error?.message || rawText.slice(0, 400);
+      throw new Error(
+        `Groq API returned ${response.status}${groqDetail ? `: ${groqDetail}` : ""}`
+      );
+    }
+    return data.choices?.[0]?.message?.content || "{}";
+  } catch (e) {
+    if (e instanceof Error && e.message.startsWith("Groq API returned")) throw e;
+    throw new Error(
+      `Groq API returned unreadable JSON (HTTP ${response.status}): ${rawText.slice(0, 280)}`
+    );
+  }
 }
 
 function strTrim(v: unknown): string {
@@ -173,28 +454,6 @@ function heuristicAiInsightsFallback(params: {
   };
 }
 
-/** Source files pulled from the repo tree for mapper/risk. Note: `*.cpp` also ends with `.c`, so `.c` is handled separately. */
-function isAllowedSourceBlobPath(path: string | undefined): boolean {
-  if (!path) return false;
-  const p = path.toLowerCase();
-  if (p.includes("node_modules")) return false;
-  const extensions = [
-    ".ts",
-    ".tsx",
-    ".js",
-    ".jsx",
-    ".py",
-    ".java",
-    ".go",
-    ".rb",
-    ".php",
-    ".cpp",
-    ".rs",
-  ];
-  if (extensions.some((ext) => p.endsWith(ext))) return true;
-  return p.endsWith(".c") && !p.endsWith(".cpp");
-}
-
 /** Strip ```json fences often wrapping model output */
 function stripJsonFences(text: string): string {
   return text
@@ -256,12 +515,6 @@ function parseJsonLoose(text: string): unknown | null {
     /* ignore */
   }
   return null;
-}
-
-function mapperBasename(p: string): string {
-  const t = p.trim().replace(/\\/g, "/");
-  const parts = t.split("/");
-  return parts[parts.length - 1] || t;
 }
 
 type MapperNodeNorm = {
@@ -396,7 +649,7 @@ function buildMapperOutput(
   for (const n of normalizedNodes) {
     if (!uniqueById.has(n.id)) uniqueById.set(n.id, n);
   }
-  let nodes = [...uniqueById.values()];
+  const nodes = [...uniqueById.values()];
 
   const idSet = new Set(nodes.map((n) => n.id));
   const basenameToId = new Map<string, string>();
@@ -490,7 +743,7 @@ function finalizeAuditDependencies(
     }));
     return {
       dependencies: fallback,
-      summary: `${summary} Showing ${fallback.length} declared package(s) from package.json.`,
+      summary: `${summary} Showing ${fallback.length} declared package(s) from detected manifests (npm, pip, cargo, Go, Maven/Gradle, Composer, RubyGems, Docker, Actions, etc.).`,
     };
   }
 
@@ -555,79 +808,127 @@ function heuristicScorerFallback(params: {
         : "Maintain current structure — no major risks reported.",
       depsCount > 12
         ? "Review dependency surface area and consolidate where possible."
-        : "Keep dependencies updated from package manifests.",
+        : "Keep dependencies updated across all declared manifests.",
       "Add or extend automated tests for critical paths.",
     ],
   };
 }
 
 export async function POST(req: Request) {
-  const { repoUrl } = await req.json();
-
-  // Parse GitHub URL
-  const match = repoUrl.match(/github\.com\/([^/]+)\/([^/]+)/);
-  if (!match) {
-    return Response.json({ error: "Invalid GitHub URL" }, { status: 400 });
+  let body: unknown;
+  try {
+    body = await req.json();
+  } catch {
+    return Response.json(
+      { error: "Invalid JSON body", detail: "The request body must be valid JSON with a repoUrl field." },
+      { status: 400 }
+    );
   }
 
-  const [, owner, repo] = match;
+  if (!body || typeof body !== "object") {
+    return Response.json({ error: "Invalid request body", detail: "Expected a JSON object." }, { status: 400 });
+  }
 
+  const repoUrlRaw = (body as Record<string, unknown>).repoUrl;
+  const parsedRepo = parseValidatedGitHubRepositoryUrl(repoUrlRaw);
+  if (!parsedRepo) {
+    return Response.json(
+      {
+        error: "Invalid GitHub repository URL",
+        detail:
+          'Provide an HTTPS repository URL such as https://github.com/<owner>/<repo>, or SSH git@github.com:owner/repo.git',
+      },
+      { status: 400 }
+    );
+  }
+
+  const groqMissing = requireGroqConfigured();
+  if (groqMissing) {
+    return Response.json(
+      { error: "Server configuration incomplete", detail: groqMissing },
+      { status: 503 }
+    );
+  }
+
+  const { owner, repo } = parsedRepo;
+  const octokit = createGithubClient();
   const encoder = new TextEncoder();
 
-  const stream = new ReadableStream({
-    async start(controller) {
-      const send = (data: object) => {
-        controller.enqueue(
-          encoder.encode(`data: ${JSON.stringify(data)}\n\n`)
-        );
-      };
+  try {
+    const stream = new ReadableStream({
+      async start(controller) {
+        const send = (data: object) => {
+          controller.enqueue(
+            encoder.encode(`data: ${JSON.stringify(data)}\n\n`)
+          );
+        };
 
-      try {
+        try {
         // ── AGENT 1: MAPPER ──────────────────────────────
         send({ agent: "mapper", status: "running", msg: "Reading repository files..." });
 
-        const { data: tree } = await octokit.git.getTree({
-          owner,
-          repo,
-          tree_sha: "HEAD",
-          recursive: "true",
-        });
+        let tree: Awaited<ReturnType<Octokit["git"]["getTree"]>>["data"];
+        try {
+          const res = await octokit.git.getTree({
+            owner,
+            repo,
+            tree_sha: "HEAD",
+            recursive: "true",
+          });
+          tree = res.data;
+        } catch (e) {
+          throw new Error(`Could not fetch repository tree for ${parsedRepo.displayUrl}: ${stringifyError(e)}`);
+        }
 
-        const files = tree.tree
-          .filter((f) => f.type === "blob" && isAllowedSourceBlobPath(f.path))
-          .slice(0, 30);
+        const allAnalyzablePaths = tree.tree
+          .filter((f) => f.type === "blob" && isAnalyzableBlobPath(f.path))
+          .map((f) => f.path!)
+          .sort((a, b) => a.localeCompare(b));
+
+        const graphPaths = diversePathSample(allAnalyzablePaths, MAX_GRAPH_PATHS);
+        const fetchTargets = buildContentFetchOrder(graphPaths, MAX_BLOB_CONTENT_FETCHES);
 
         const fileContents: { path: string; content: string }[] = [];
-        
-        for (const file of files.slice(0, 15)) {
+        const contentByPath = new Map<string, string>();
+
+        for (const filePath of fetchTargets) {
           try {
             const { data: blob } = await octokit.repos.getContent({
               owner,
               repo,
-              path: file.path!,
+              path: filePath,
             });
             if ("content" in blob) {
               const content = Buffer.from(blob.content, "base64").toString("utf-8");
-              fileContents.push({ path: file.path!, content: content.slice(0, 500) });
+              const slice = content.slice(0, 800);
+              fileContents.push({ path: filePath, content: slice });
+              contentByPath.set(filePath, slice);
             }
-          } catch {}
+          } catch {
+            /* skip missing/binary */
+          }
         }
 
-        const mapperKnownPaths = fileContents.map((f) => f.path);
-        const mapperPrompt = `You are a codebase mapper. Build a file-level dependency graph. Return ONLY valid JSON (no markdown, no code fences).
+        const mapperInputFiles = graphPaths.map((path) => ({
+          path,
+          name: mapperBasename(path),
+          size: contentByPath.get(path)?.length ?? path.length,
+          previewHint: (contentByPath.get(path) ?? "").slice(0, 140),
+        }));
 
-Input files (use these exact "path" strings for every node id and for edge source/target):
-${JSON.stringify(
-          fileContents.map((f) => ({
-            path: f.path,
-            name: mapperBasename(f.path),
-            size: f.content.length,
-          }))
-        )}
+        const mapperKnownPaths = graphPaths;
+        const mapperPrompt = `You are a multi-language codebase architecture agent. Build a file-level dependency/module graph across any mix of: JavaScript/TypeScript, Python, Java, Go, Rust, Ruby, PHP, C/C++, Swift, Kotlin, shell, Docker, GitHub Actions, and config (.env, YAML, TOML, INI).
+
+Infer edges using language-appropriate relationships: ES import/require, Python import/from, Java import/package, Go import, Rust mod/use, Ruby require/load, PHP include/use/require, C/C++ #include, Swift/Kotlin imports, Dockerfile COPY/FROM, docker-compose services, workflow needs/uses, etc.
+
+Return ONLY valid JSON (no markdown, no code fences).
+
+Input files (every "path" is a real repo path — use these exact strings for node ids and edge endpoints):
+${JSON.stringify(mapperInputFiles)}
 
 Rules:
-- Every node "id" and every edge "source"/"target" MUST be copied exactly from a "path" in the input (full repo path).
-- Infer plausible links between files (same feature folder, likely imports, shared prefixes). Omit edges if unsure; do not invent paths.
+- Every node "id" and every edge "source"/"target" MUST match a "path" from the input list exactly.
+- Use folder structure, naming, and previewHint text to infer likely links. Do not invent paths outside the list.
 
 Return this exact JSON shape:
 {
@@ -642,43 +943,37 @@ Return this exact JSON shape:
     }
   ],
   "edges": [ { "source": "<path>", "target": "<path>" } ],
-  "summary": "brief summary"
+  "summary": "brief multi-language summary"
 }`;
 
         const mapperText = await groqChatCompletion(mapperPrompt, { max_tokens: 1536 });
         const mapperBuilt = buildMapperOutput(
           mapperText,
           mapperKnownPaths,
-          `Mapped ${files.length} files`
+          `Mapped ${graphPaths.length} of ${allAnalyzablePaths.length} analyzable files`
         );
         const mapperData = {
           nodes: mapperBuilt.nodes,
           edges: mapperBuilt.edges,
           summary: mapperBuilt.summary,
+          stats: {
+            repoFilesMatched: allAnalyzablePaths.length,
+            graphPathsUsed: graphPaths.length,
+            filesContentSampled: fileContents.length,
+          },
         };
 
-        send({ agent: "mapper", status: "done", data: mapperData, msg: `Mapped ${files.length} files successfully` });
+        send({
+          agent: "mapper",
+          status: "done",
+          data: mapperData,
+          msg: `Mapped ${graphPaths.length} of ${allAnalyzablePaths.length} analyzable files`,
+        });
 
-        // ── Fetch package.json for Auditor ─────────────────
-        const packageJsonBlobPaths = tree.tree
-          .filter(
-            (f) =>
-              f.type === "blob" &&
-              f.path &&
-              !f.path.includes("node_modules") &&
-              (f.path === "package.json" || f.path.endsWith("/package.json"))
-          )
-          .map((f) => f.path!)
-          .sort((a, b) => {
-            if (a === "package.json") return -1;
-            if (b === "package.json") return 1;
-            return a.split("/").length - b.split("/").length;
-          });
-
-        type PkgDepEntry = { name: string; range: string; kind: string; fromPath: string };
+        type PkgDepEntry = ManifestDepEntry;
         const auditorPackageJsonPaths: string[] = [];
         const auditorDependencyEntries: PkgDepEntry[] = [];
-        const auditorPackageJsonSnippets: { path: string; preview: string }[] = [];
+        const auditorManifestSnippets: { path: string; preview: string }[] = [];
         const seenDepNames = new Set<string>();
 
         const recordDeps = (
@@ -694,47 +989,88 @@ Return this exact JSON shape:
           }
         };
 
-        for (const pkgPath of packageJsonBlobPaths.slice(0, 6)) {
+        const auditorManifestPaths = [...new Set(allAnalyzablePaths.filter(isDependencyManifestPath))].sort(
+          (a, b) => manifestPriority(a) - manifestPriority(b) || a.localeCompare(b)
+        );
+
+        for (const manifestPath of auditorManifestPaths.slice(0, MAX_MANIFEST_PATHS_FETCH)) {
           try {
             const { data: blob } = await octokit.repos.getContent({
               owner,
               repo,
-              path: pkgPath,
+              path: manifestPath,
             });
             if (!("content" in blob)) continue;
-
             const raw = Buffer.from(blob.content, "base64").toString("utf-8");
-            const pkg = JSON.parse(raw) as {
-              dependencies?: Record<string, string>;
-              devDependencies?: Record<string, string>;
-              peerDependencies?: Record<string, string>;
-              optionalDependencies?: Record<string, string>;
-            };
+            const base = mapperBasename(manifestPath).toLowerCase();
 
-            auditorPackageJsonPaths.push(pkgPath);
-            auditorPackageJsonSnippets.push({ path: pkgPath, preview: raw.slice(0, 4000) });
-            recordDeps(pkg.dependencies, "dependencies", pkgPath);
-            recordDeps(pkg.devDependencies, "devDependencies", pkgPath);
-            recordDeps(pkg.peerDependencies, "peerDependencies", pkgPath);
-            recordDeps(pkg.optionalDependencies, "optionalDependencies", pkgPath);
+            if (base === "package.json") {
+              try {
+                const pkg = JSON.parse(raw) as {
+                  dependencies?: Record<string, string>;
+                  devDependencies?: Record<string, string>;
+                  peerDependencies?: Record<string, string>;
+                  optionalDependencies?: Record<string, string>;
+                };
+                auditorPackageJsonPaths.push(manifestPath);
+                auditorManifestSnippets.push({ path: manifestPath, preview: raw.slice(0, 4000) });
+                recordDeps(pkg.dependencies, "dependencies", manifestPath);
+                recordDeps(pkg.devDependencies, "devDependencies", manifestPath);
+                recordDeps(pkg.peerDependencies, "peerDependencies", manifestPath);
+                recordDeps(pkg.optionalDependencies, "optionalDependencies", manifestPath);
+              } catch {
+                auditorManifestSnippets.push({ path: manifestPath, preview: raw.slice(0, 2000) });
+              }
+              continue;
+            }
+
+            auditorManifestSnippets.push({ path: manifestPath, preview: raw.slice(0, 4000) });
+            for (const e of parseManifestByPath(manifestPath, raw)) {
+              if (seenDepNames.has(e.name)) continue;
+              seenDepNames.add(e.name);
+              auditorDependencyEntries.push(e);
+            }
           } catch {
-            /* invalid JSON or fetch error — skip */
+            /* skip */
           }
         }
+
+        const manifestSummary =
+          auditorManifestPaths.length > 0
+            ? `Loaded ${auditorManifestPaths.length} dependency manifest(s): ${auditorManifestPaths.slice(0, 12).join(", ")}${auditorManifestPaths.length > 12 ? "…" : ""}`
+            : "No dependency manifests detected — inferring from file paths only.";
 
         // ── AGENT 2 & 3: PARALLEL ────────────────────────
         send({ agent: "risk", status: "running", msg: "Analyzing risks and dependencies..." });
         send({
           agent: "auditor",
           status: "running",
-          msg:
-            auditorPackageJsonPaths.length > 0
-              ? `Loaded ${auditorPackageJsonPaths.length} package.json file(s): ${auditorPackageJsonPaths.join(", ")}`
-              : "No package.json in tree — inferring dependencies from codebase files...",
+          msg: manifestSummary,
         });
 
-        const riskPrompt = `You are a risk detector. Analyze this codebase for issues. Return ONLY valid JSON (no markdown, no code fences).
-Files analyzed: ${JSON.stringify(fileContents.map(f => ({ path: f.path, preview: f.content.slice(0, 200) })))}
+        const riskFilesForModel = fileContents.slice(0, 48).map((f) => ({
+          path: f.path,
+          preview: f.content.slice(0, 220),
+        }));
+
+        const riskPrompt = `You are a security and code-quality risk detector for a MULTI-LANGUAGE repository. Analyze the file previews below.
+
+Cover language-specific issues when relevant:
+- JS/TS: dangerous eval, hardcoded secrets, prototype pollution patterns, missing input validation.
+- Python: shell=True subprocess, pickle on untrusted data, DEBUG=True, weak crypto, SQL string formatting.
+- Java: unsafe deserialization, JNDI, weak TLS, native command execution.
+- Go: ignoring errors, weak rand, command injection via exec.
+- Rust: unsafe blocks, unwrap on external input, command args injection.
+- Ruby: open-uri + user URL, eval, mass assignment, command injection.
+- PHP: include/require on user paths, weak typing around system calls, dangerous functions (exec/shell_exec/system).
+- C/C++: strcpy/sprintf overflows, unchecked mallocs, format strings, command injection.
+- Swift/Kotlin: weak keychain usage patterns, WebView risks, JNI/native bridges.
+- Shell: unquoted vars, curl|bash, secrets in env exports.
+- Docker/CI: privileged containers, credential leakage, unpinned third-party actions, overly broad secrets.
+- Config (.env, yaml, toml): live API keys, weak defaults, debug flags in production paths.
+
+Return ONLY valid JSON (no markdown, no code fences).
+Files analyzed: ${JSON.stringify(riskFilesForModel)}
 
 Return this exact JSON shape. Every object in "risks" MUST include all of these keys: title, file, score, severity, whatIsThis, whyItsDangerous, howToFixIt.
 - title: short label for the finding
@@ -757,41 +1093,47 @@ Return this exact JSON shape. Every object in "risks" MUST include all of these 
       "howToFixIt": "string"
     }
   ],
-  "summary": "brief summary"
-}`;
+  "summary": "brief summary covering security and code-quality findings"
+}
 
-        const auditorPrompt = `You are a dependency auditor for a GitHub repository.
+Also include code-quality / maintainability risks when visible: excessive complexity, dead patterns, poor separation of concerns, missing error handling, and language-specific smells (e.g. long methods in Java, unwrap chains in Rust, global state in PHP, etc.).`;
 
-PRIMARY SOURCE (use this when provided): Declared npm dependencies fetched from actual package.json file(s) in the repo Git tree — not guesses from source paths alone.
+        const auditorPrompt = `You are a cross-ecosystem dependency auditor. The repository may use npm (package.json), pip (requirements.txt / Pipfile / pyproject.toml), Cargo, Go modules, RubyGems (Gemfile), Composer (composer.json), Maven (pom.xml), Gradle, Docker base images, docker-compose images, and GitHub Actions (uses:).
 
-Package.json blob paths fetched from repo (excluding node_modules):
-${JSON.stringify(auditorPackageJsonPaths.length ? auditorPackageJsonPaths : ["(none found)"])}
+PRIMARY SOURCE: Declared dependencies parsed from real manifest files in the Git tree — not guesses from paths alone.
 
-Declared dependency entries (deduplicated by package name — first occurrence wins when multiple package.json files exist). Fields: name, semver range declared in manifest, dependency kind (dependencies / devDependencies / etc.), originating package.json path:
-${JSON.stringify(auditorDependencyEntries.slice(0, 200))}
+npm package.json paths (may be empty):
+${JSON.stringify(auditorPackageJsonPaths.length ? auditorPackageJsonPaths : ["(none)"])}
 
-Truncated raw package.json excerpts for context:
-${JSON.stringify(auditorPackageJsonSnippets)}
+All manifest paths inspected:
+${JSON.stringify(auditorManifestPaths.length ? auditorManifestPaths : ["(none)"])}
 
-Code file paths sampled from the codebase (secondary context):
+Declared dependency entries (deduplicated by name — first occurrence wins). Fields: name, declared range/version, kind (npm / pip / cargo / go-mod / maven / gradle / composer / docker / actions / etc.), originating manifest path:
+${JSON.stringify(auditorDependencyEntries.slice(0, 220))}
+
+Truncated manifest excerpts for context:
+${JSON.stringify(auditorManifestSnippets.slice(0, 24))}
+
+Sampled source/config paths (secondary context):
 ${JSON.stringify(fileContents.map((f) => f.path))}
 
 Instructions:
-1. Prefer analyzing the real manifests above. Reference package names and version ranges exactly as declared.
-2. If no package.json was found, infer dependencies cautiously from file paths only and note that in the summary.
-3. Assess whether entries look outdated, loosely specified, or plausibly vulnerable from general ecosystem knowledge — return conservative severity unless clearly critical.
+1. Prefer the manifests above. Reference names and declared versions exactly.
+2. If no manifests were found, infer cautiously from paths and say so in the summary.
+3. Flag outdated ranges, missing pins, or well-known vulnerable lines conservatively (PyPI, crates.io, Maven Central, npm, RubyGems, Packagist, Go proxy, Docker hub tags, unpinned GitHub Actions).
+4. For composite Maven coordinates "group:artifact", treat as a single dependency name.
 
 Return ONLY valid JSON:
 {
   "dependencies": [
     {
-      "name": "package",
-      "version": "exact semver range from manifest or best inference",
+      "name": "package or coordinate",
+      "version": "declared range or tag from manifest",
       "status": "vulnerable|outdated|ok",
-      "issue": "one or two sentences: what is wrong or why it is ok"
+      "issue": "one or two sentences"
     }
   ],
-  "summary": "brief summary referencing whether package.json was used"
+  "summary": "brief summary naming which ecosystems were audited"
 }
 
 Each dependency object MUST include all four keys: name, version, status, issue. Use status "ok" with a short positive issue line when no problem is found.`;
@@ -813,13 +1155,15 @@ Each dependency object MUST include all four keys: name, version, status, issue.
         const scorerNodes = Array.isArray(mapperData.nodes) ? mapperData.nodes : [];
         const scorerRisks = Array.isArray(riskData.risks) ? riskData.risks : [];
         const scorerDeps = Array.isArray(auditData.dependencies) ? auditData.dependencies : [];
-        const filesMappedCount = scorerNodes.length || files.length;
+        const filesMappedCount =
+          scorerNodes.length || mapperData.stats?.graphPathsUsed || graphPaths.length;
 
-        const scorerPrompt = `Analyze this codebase health data and return ONLY a JSON object. No markdown, no explanation.
+        const scorerPrompt = `Analyze this multi-language codebase health data and return ONLY a JSON object. No markdown, no explanation.
 Just raw JSON.
 
 Data:
-- Files mapped: ${filesMappedCount}
+- Files in dependency graph: ${filesMappedCount}
+- Total analyzable files in repo: ${mapperData.stats?.repoFilesMatched ?? allAnalyzablePaths.length}
 - Risks found: ${scorerRisks.length}
 - Risk details: ${JSON.stringify(scorerRisks.slice(0, 50))}
 - Dependencies: ${scorerDeps.length}
@@ -906,20 +1250,39 @@ Rules:
           msg: `Health score: ${scorerData.score}/100`,
         });
         send({ agent: "complete", status: "done", msg: "Analysis complete!" });
+        } catch (error: unknown) {
+          const msg = stringifyError(error) || "Analysis failed unexpectedly.";
+          try {
+            send({ agent: "error", status: "error", msg });
+          } catch {
+            controller.enqueue(
+              encoder.encode(`data: ${JSON.stringify({ agent: "error", status: "error", msg })}\n\n`)
+            );
+          }
+        } finally {
+          try {
+            controller.close();
+          } catch {
+            /* already closed */
+          }
+        }
+      },
+    });
 
-      } catch (error: any) {
-        send({ agent: "error", status: "error", msg: error.message });
-      } finally {
-        controller.close();
-      }
-    },
-  });
-
-  return new Response(stream, {
-    headers: {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      "Connection": "keep-alive",
-    },
-  });
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+      },
+    });
+  } catch (error: unknown) {
+    return Response.json(
+      {
+        error: "Failed to start analysis stream",
+        detail: stringifyError(error),
+      },
+      { status: 500 }
+    );
+  }
 }
