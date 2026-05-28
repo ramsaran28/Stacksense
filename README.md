@@ -1,33 +1,46 @@
-# StackSense
+# StackSense 🔍
 
-StackSense is a free AI-powered tool that scans any public GitHub repository and gives you a full health report in under 60 seconds. No account needed, no credit card, no code changes required.
+> AI-powered GitHub repository health analyzer. Paste any public repo URL and get a full security audit, dependency check, and codebase map in under 60 seconds.
+
+## Live Demo
+🔗 [stacksense-sandy.vercel.app](https://stacksense-sandy.vercel.app)
 
 ## What it does
 
-Paste any public GitHub repo URL and StackSense will:
-- Find security vulnerabilities like hardcoded secrets, weak crypto, and missing input validation
-- Audit dependencies across multiple package managers and flag outdated or risky packages
-- Map out your entire codebase structure as an interactive visual graph
-- Give your repo an overall health score out of 100
+StackSense runs 4 AI agents in parallel the moment you hit Analyze:
 
-## How it works
+| Agent | Role |
+|-------|------|
+| **Mapper** | Walks the entire file tree and builds an interactive codebase graph |
+| **Risk Detector** | Scans files for hardcoded secrets, weak crypto, and missing input validation |
+| **Auditor** | Parses dependency files and flags outdated or high-risk packages |
+| **Scorer** | Combines all findings into a final health score out of 100 |
 
-4 AI agents run in parallel the moment you hit Analyze:
-- **Mapper** — walks the entire file tree and builds the codebase graph
-- **Risk Detector** — scans files for security issues and code quality problems
-- **Auditor** — parses dependency files and checks for vulnerabilities
-- **Scorer** — combines all findings into a final health score
+## Features
 
-## Supported Languages
-TypeScript, JavaScript, Python, Java, Go, Rust, Ruby, PHP, C/C++, Swift, Kotlin, Shell, Docker, GitHub Actions, and more
+- 🛡️ Real security vulnerability detection (tested on OWASP NodeGoat)
+- 📦 Dependency auditing across 10+ package managers
+- 🗺️ Interactive D3.js codebase visualizer
+- 🌐 Supports 15+ languages including TypeScript, Python, Go, Rust, Java, and more
+- ⚡ No account needed, no credit card, no code changes required
 
 ## Tech Stack
-- Next.js 16, TypeScript
-- Meta Llama via Groq API
-- GitHub REST API (read-only)
-- D3.js for codebase visualization
-- Tailwind CSS, Radix UI
-- Deployed on Vercel
 
-## Live Demo
-[stacksense-sandy.vercel.app](https://stacksense-sandy.vercel.app)
+- **Framework:** Next.js 16, TypeScript
+- **AI:** Meta Llama via Groq API
+- **Data:** GitHub REST API (read-only)
+- **Visualization:** D3.js
+- **Styling:** Tailwind CSS, Radix UI
+- **Deployment:** Vercel
+
+## Getting Started
+
+```bash
+git clone https://github.com/ramsaran28/Stacksense
+cd Stacksense
+npm install
+cp .env.example .env.local  # add your GROQ_API_KEY and GITHUB_TOKEN
+npm run dev
+```
+
+## Environment Variables
